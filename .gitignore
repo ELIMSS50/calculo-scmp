@@ -1,0 +1,12 @@
+# Hypnotoad
+script/hypnotoad.pid
+
+# Logs
+log/
+
+# Archivos temporales de Perl
+*.bak
+*.swp
+
+# Docker
+.env

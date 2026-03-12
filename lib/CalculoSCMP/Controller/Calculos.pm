@@ -70,6 +70,11 @@ my ($_carb_ph_upper, $_carb_ph_lower, $_bicarb_ph_upper, $_bicarb_ph_lower);
 sub calcular ($self) {
     my $p = $self->req->json;
 
+    # Timeout de seguridad: 30 segundos máximo para todo el cálculo
+    local $SIG{ALRM} = sub { die "timeout
+" };
+    alarm(30);
+
     # --- Validación básica del body ---
     unless (defined $p && ref $p eq 'HASH') {
         return $self->render(json => { error => 'Se requiere un cuerpo JSON válido' }, status => 400);
@@ -431,7 +436,8 @@ sub calcular ($self) {
 
             $_do_carb   = 1;
             $_do_bicarb = 0;
-            ($alk4, $Ct4) = _powell($alk4, $Ct4, 0.00001);
+            eval { ($alk4, $Ct4) = _powell($alk4, $Ct4, 0.00001); };
+            ($alk4, $Ct4) = (0, 0) if $@;
 
             if ($alk4 > 0 && $Ct4 > 0) {
                 $Method4_success = 1;
@@ -479,7 +485,8 @@ sub calcular ($self) {
 
             $_do_carb   = 0;
             $_do_bicarb = 1;
-            ($alk3, $Ct3) = _powell($alk3, $Ct3, 0.00001);
+            eval { ($alk3, $Ct3) = _powell($alk3, $Ct3, 0.00001); };
+            ($alk3, $Ct3) = (0, 0) if $@;
 
             if ($alk3 > 0 && $Ct3 > 0) {
                 $Method3_success = 1;
@@ -548,14 +555,15 @@ sub calcular ($self) {
 
             $_do_carb   = 0;
             $_do_bicarb = 0;
-            ($alk5, $Ct5) = _powell($alk5, $Ct5, 0.00001);
+            eval { ($alk5, $Ct5) = _powell($alk5, $Ct5, 0.00001); };
+            ($alk5, $Ct5) = (0, 0) if $@;
 
             if ($alk5 > 0 && $Ct5 > 0) {
                 my (%vol5, %calc_slope5);
                 my ($lv, $lp);
                 my $start_ph = $highest_ph > $carb_ph_upper ? $highest_ph : $carb_ph_upper;
                 my $ph = $start_ph;
-                while ($ph >= $lowest_ph || $ph >= $bicarb_ph_lower) {
+                while ($ph >= $lowest_ph && $ph >= $bicarb_ph_lower) {
                     my $H = 10.0 ** (-$ph);
                     my $i = sprintf("%.3f", $ph);
                     $vol5{$i} = $_volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
@@ -771,8 +779,121 @@ sub calcular ($self) {
     }
 
     # =========================================================================
+    # DATOS PARA GRÁFICAS
+    # =========================================================================
+
+    # --- Gráfica 1: Curva de titulación medida + pendiente ---
+    my (@g_titulacion, @g_pendiente);
+    {
+        my $lv;
+        foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+            push @g_titulacion, { x => $data{$ph} + 0, ph => $ph + 0 };
+            if (defined $lv && exists $slope{$ph}) {
+                push @g_pendiente, {
+                    x         => _r2(($data{$ph} + $lv) / 2.0),
+                    pendiente => $slope{$ph} + 0,
+                };
+            }
+            $lv = $data{$ph};
+        }
+    }
+
+    # --- Gráfica 2: Curva teórica CTC-1 ---
+    my (@g_ctc1_curva, @g_ctc1_pendiente);
+    if ($do_ctc && $resultado_ctc1 && !exists $resultado_ctc1->{error}
+        && defined $resultado_ctc1->{endpoint_bicarbonato_vol_ml}) {
+        if (1) {
+            my $ep_vol = $resultado_ctc1->{endpoint_bicarbonato_vol_ml};
+            my $alk3_r = $ep_vol * $F3 / $volume;
+            my $H0     = 10.0 ** (-$highest_ph);
+            my $Ct3_r  = ($alk3_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
+                         * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
+            my ($lv2, $lp2);
+            my $_phi_hi3 = $bicarb_ph_upper < $highest_ph ? $bicarb_ph_upper : $highest_ph;
+            my $_phi_lo3 = $bicarb_ph_lower > $lowest_ph  ? $bicarb_ph_lower : $lowest_ph;
+            my $ph = $_phi_hi3;
+            while ($ph >= $_phi_lo3 - 0.001) {
+                my $H   = 10.0 ** (-$ph);
+                my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
+                if ($den) {
+                    my $v = $volume / $den
+                            * ($alk3_r / ALK_MEQ
+                               - $Ct3_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
+                               - $Kw/$H + $H/$gamma_H);
+                    push @g_ctc1_curva, { x => _r2($v), ph => _r2($ph) };
+                    if (defined $lv2 && abs($v - $lv2) > 1e-10) {
+                        push @g_ctc1_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2(($lp2 - $ph) / ($v - $lv2)) };
+                    }
+                    $lv2 = $v; $lp2 = $ph;
+                }
+                $ph -= 0.01;
+            }
+        }
+    }
+
+    # --- Gráfica 3: Curva teórica CTC-2 (ajuste curva completa) ---
+    my (@g_ctc2_curva, @g_ctc2_pendiente);
+    if ($do_ctc && $resultado_ctc2 && !exists $resultado_ctc2->{error}) {
+        if (defined $resultado_ctc2->{endpoint_bicarbonato_vol_ml}) {
+            my $ep_vol = $resultado_ctc2->{endpoint_bicarbonato_vol_ml};
+            my $alk5_r = $ep_vol * $F3 / $volume;
+            my $H0     = 10.0 ** (-$highest_ph);
+            my $Ct5_r  = ($alk5_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
+                         * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
+            my ($lv2, $lp2);
+            my $ph_start = $highest_ph > $carb_ph_upper ? $highest_ph : $carb_ph_upper;
+            my $ph = $ph_start;
+            while ($ph >= $lowest_ph - 0.001) {
+                my $H   = 10.0 ** (-$ph);
+                my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
+                if ($den) {
+                    my $v = $volume / $den
+                            * ($alk5_r / ALK_MEQ
+                               - $Ct5_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
+                               - $Kw/$H + $H/$gamma_H);
+                    push @g_ctc2_curva, { x => _r2($v), ph => _r2($ph) };
+                    if (defined $lv2) {
+                        my $s = ($lp2 - $ph) / ($v - $lv2) if abs($v - $lv2) > 1e-10;
+                        push @g_ctc2_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2($s // 0) };
+                    }
+                    $lv2 = $v; $lp2 = $ph;
+                }
+                $ph -= 0.01;
+            }
+        }
+    }
+
+    # --- Gráfica 4: Funciones Gran ---
+    my (%g_gran_F1, %g_gran_F2, %g_gran_F3, %g_gran_F4);
+    my (@g_F1, @g_F2, @g_F3, @g_F4);
+    if ($do_gran && $resultado_gran) {
+        my $bicarb_ep = $resultado_gran->{F1}{endpoint_bicarbonato_vol_ml} // 0;
+        my $carb_ep   = $resultado_gran->{F2}{endpoint_carbonato_vol_ml}  // 0;
+
+        foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+            my $H = 10.0 ** (-$ph);
+            # F1
+            if ($ph <= $ph_split) {
+                my $gf1 = ($volume + $data{$ph}) * $H / $gamma_H;
+                push @g_F1, { x => $data{$ph} + 0, y => $gf1 + 0 };
+            }
+            # F2 — solo si F1 tuvo éxito
+            if ($bicarb_ep > 0) {
+                my $gf2 = ($bicarb_ep - $data{$ph}) * $H;
+                push @g_F2, { x => $data{$ph} + 0, y => $gf2 + 0 };
+            }
+            # F3
+            if ($carb_ep >= 0) {
+                my $gf3 = ($data{$ph} - $carb_ep) * (10.0 ** $ph);
+                push @g_F3, { x => $data{$ph} + 0, y => $gf3 + 0 };
+            }
+        }
+    }
+
+    # =========================================================================
     # Respuesta final
     # =========================================================================
+    alarm(0); # cancelar el alarm antes de responder
     return $self->render(json => {
         constantes => {
             log10_Kw      => _r2($log10Kw),
@@ -796,6 +917,23 @@ sub calcular ($self) {
         ctc_2        => $resultado_ctc2,
         gran         => $resultado_gran,
         advertencias => \@advertencias,
+        graficas     => {
+            titulacion => \@g_titulacion,
+            pendiente  => \@g_pendiente,
+            ctc_1      => {
+                curva     => \@g_ctc1_curva,
+                pendiente => \@g_ctc1_pendiente,
+            },
+            ctc_2      => {
+                curva     => \@g_ctc2_curva,
+                pendiente => \@g_ctc2_pendiente,
+            },
+            gran       => {
+                F1 => \@g_F1,
+                F2 => \@g_F2,
+                F3 => \@g_F3,
+            },
+        },
     });
 }
 
@@ -986,7 +1124,8 @@ sub _mnbrak {
     my $cx = $bx + $gold * ($bx - $ax);
     my $fc = _onedim($cx);
 
-    while ($fb >= $fc) {
+    my $_mnbrak_iter = 0;
+    while ($fb >= $fc && $_mnbrak_iter++ < 200) {
         my $r   = ($bx - $ax) * ($fb - $fc);
         my $q   = ($bx - $cx) * ($fb - $fa);
         my $u   = $bx - (($bx-$cx)*$q - ($bx-$ax)*$r) / (2.0 * _sign(_max(abs($q-$r), $tiny), $q-$r));

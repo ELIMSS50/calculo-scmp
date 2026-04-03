@@ -74,7 +74,12 @@ $t->post_ok('/calcular', json => {
 ->json_has('/gran/F2')
 ->json_has('/gran/F3')
 ->json_has('/gran/F4')
-->json_has('/advertencias');
+->json_has('/gran/F5')
+->json_has('/gran/F6')
+->json_has('/advertencias')
+->json_has('/graficas')
+->json_has('/graficas/titulacion')
+->json_has('/graficas/pendiente');
 
 # ---------------------------------------------------------------------------
 # POST /calcular — solo con campos mínimos (defaults)

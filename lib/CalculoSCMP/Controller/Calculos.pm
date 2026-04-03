@@ -4,7 +4,7 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 # =============================================================================
 # CalculoSCMP — Controlador de cálculos de alcalinidad y pH
 #
-# Basado en "The Alkalinity Calculator" de Stewart A. Rounds (USGS)
+# Traducción LITERAL de "The Alkalinity Calculator" de Stewart A. Rounds (USGS)
 # Copyright (c) 2003-2012, Stewart A. Rounds — GPLv2
 # Adaptado para API REST con Mojolicious.
 #
@@ -29,22 +29,8 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 #   },
 #   "endpoint_carbonato"  : número  — pH endpoint fijo carbonato (default: 8.3)
 #   "endpoint_bicarbonato": número  — pH endpoint fijo bicarbonato (default: 4.5)
-#
-#   -- PENDIENTE --
-#   "calcio": número  — mg/L, recibido pero sin uso definido aún
-# }
-#
-# Salida JSON:
-# {
-#   "constantes": { "log10_Kw", "log10_K1", "log10_K2", "fuerza_ionica" },
-#   "especiacion_basica": { "bicarbonato_mg_l", "carbonato_mg_l",
-#                           "hidroxido_mg_l", "alcalinidad_meq_l" },
-#   "inflexion":    { ... } | null,
-#   "endpoint_fijo":{ ... } | null,
-#   "ctc_1":        { ... } | null,
-#   "ctc_2":        { ... } | null,
-#   "gran":         { ... } | null,
-#   "advertencias": [ "texto", ... ]
+#   "counts_por_ml" : número  — factor de conversión counts→mL (default: 1.0, 800 para Hach)
+#   "calcio"        : número  — mg/L, recibido pero sin uso definido aún
 # }
 # =============================================================================
 
@@ -60,7 +46,7 @@ use constant OH_MEQ     => 17007.3;
 my (@_pcom, @_xicom);
 my (%_data, $_highest_ph, $_lowest_ph, %_slope);
 my ($_Kw, $_K1, $_K2, $_gamma_H);
-my ($_volume, $_acid_conc, $_cor_factor);
+my ($_volume, $_acid_conc, $_cor_factor, $_cpm);
 my ($_do_carb, $_do_bicarb);
 my ($_carb_ph_upper, $_carb_ph_lower, $_bicarb_ph_upper, $_bicarb_ph_lower);
 
@@ -71,8 +57,7 @@ sub calcular ($self) {
     my $p = $self->req->json;
 
     # Timeout de seguridad: 30 segundos máximo para todo el cálculo
-    local $SIG{ALRM} = sub { die "timeout
-" };
+    local $SIG{ALRM} = sub { die "timeout\n" };
     alarm(30);
 
     # --- Validación básica del body ---
@@ -114,11 +99,16 @@ sub calcular ($self) {
     my $do_gran      = exists $met->{gran}           ? $met->{gran}           : 1;
 
     # Endpoints fijos (con defaults estándar)
-    my $carb_endpt2  = $p->{endpoint_carbonato}   // 8.3;
+    my $carb_endpt2   = $p->{endpoint_carbonato}   // 8.3;
     my $bicarb_endpt2 = $p->{endpoint_bicarbonato} // 4.5;
 
     # TODO: calcio se recibe pero sin uso definido aún
     my $calcio = $p->{calcio};
+
+    # Factor de conversión counts → mL del titulador digital
+    # (800 para titulador Hach, 1.0 para buretas en mL).
+    my $cpm = ($p->{counts_por_ml} // 1.0) + 0;
+    $cpm    = 1.0 if $cpm <= 0;
 
     # --- Parsear y validar la tabla de titulación ---
     my $tit_raw = $p->{titulacion};
@@ -137,7 +127,7 @@ sub calcular ($self) {
     }
 
     # Calcular pendientes y detectar highest/lowest pH (mismo código que ac_calcs.pl)
-    my (%slope, $highest_ph, $lowest_ph, $last_ph, $last_vol);
+    my (%slope, $highest_ph, $lowest_ph, $last_ph, $last_count);
     my @advertencias;
     my $warn_vol = 0;
 
@@ -145,12 +135,12 @@ sub calcular ($self) {
         if (!defined $highest_ph) {
             $highest_ph = $ph;
             $last_ph    = $ph;
-            $last_vol   = $data{$ph};
-        } elsif (abs($data{$ph} - $last_vol) != 0.0) {
-            $slope{$ph} = sprintf("%.6f", ($last_ph - $ph) / ($data{$ph} - $last_vol));
-            $warn_vol   = 1 if ($data{$ph} < $last_vol);
+            $last_count = $data{$ph};
+        } elsif (abs($data{$ph} - $last_count) != 0.0) {
+            $slope{$ph} = sprintf("%.6f", ($last_ph - $ph) / ($data{$ph} - $last_count));
+            $warn_vol   = 1 if ($data{$ph} < $last_count);
             $last_ph    = $ph;
-            $last_vol   = $data{$ph};
+            $last_count = $data{$ph};
             $lowest_ph  = $ph;
         } else {
             delete $data{$ph};
@@ -174,10 +164,13 @@ sub calcular ($self) {
     my $log10K2 = log($K2) / log(10.0);
     my $ph_split = -1.0 * $log10K1;
 
-    # Factores F (mismo cálculo que ac_calcs.pl, counts_per_mL=1 porque usamos mL)
-    my $F1 = CARB_MEQ   * $acid_conc * $cor_factor;
-    my $F2 = BICARB_MEQ * $acid_conc * $cor_factor;
-    my $F3 = ALK_MEQ    * $acid_conc * $cor_factor;
+    # Factores F en unidades del titulador (counts):
+    my $F1 = CARB_MEQ   * $acid_conc * $cor_factor / $cpm;
+    my $F2 = BICARB_MEQ * $acid_conc * $cor_factor / $cpm;
+    my $F3 = ALK_MEQ    * $acid_conc * $cor_factor / $cpm;
+    # Factor F en mL (sin /cpm): para los métodos CTC cuyo optimizador Powell
+    # devuelve endpoints en mL (calculados con la ecuación termodinámica).
+    my $F3_ml = ALK_MEQ * $acid_conc * $cor_factor;
 
     # Guardar estado global para el optimizador
     %_data       = %data;
@@ -188,6 +181,7 @@ sub calcular ($self) {
     $_volume     = $volume;
     $_acid_conc  = $acid_conc;
     $_cor_factor = $cor_factor;
+    $_cpm        = $cpm;
 
     # Verificar que la titulación llega suficientemente abajo
     if ($lowest_ph >= $ph_split && ($do_inflexion || $do_fixed)) {
@@ -204,13 +198,13 @@ sub calcular ($self) {
     # =========================================================================
     my ($carb_endpt1_vol, $carb_endpt1, $Method1carb_fail) = (0, undef, 0);
     my ($bicarb_endpt1_vol, $bicarb_endpt1, $alk1);
+    my $last_vol;
 
     # Carbonato (solo si pH inicial > 8.3)
     if ($highest_ph > 8.3) {
         my ($max_slope, $n, $found_tie) = (0, 0, 0);
         my ($tie_vol);
         $last_vol = $data{$highest_ph};
-        my $last_ph_l = $highest_ph;
 
         foreach my $ph (reverse sort { $a <=> $b } keys %data) {
             last if ($ph <= $ph_split);
@@ -226,7 +220,6 @@ sub calcular ($self) {
                 $n++;
             }
             $last_vol = $data{$ph};
-            $last_ph_l = $ph;
         }
 
         if ($n > 0) {
@@ -247,6 +240,8 @@ sub calcular ($self) {
             $Method1carb_fail = 1;
             $carb_endpt1_vol  = 0;
         }
+    } else {
+        $carb_endpt1_vol = 0;
     }
 
     # Bicarbonato
@@ -285,7 +280,6 @@ sub calcular ($self) {
             }
             $alk1 = $bicarb_endpt1_vol * $F3 / $volume;
         } else {
-            # Sin datos suficientes — usar el último punto como fallback
             $bicarb_endpt1_vol = $data{$lowest_ph};
             $alk1 = $bicarb_endpt1_vol * $F3 / $volume;
             $do_inflexion = 0;
@@ -296,7 +290,7 @@ sub calcular ($self) {
     my ($bicarb1_mg, $carb1_mg, $oh1_mg) = _get_speciation($alk1 / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
     my $check1 = _get_criteria($alk1 / ALK_MEQ, $bicarb_endpt1_vol, $carb_endpt1_vol, 0,
                                $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                               $Kw, $K1, $K2, $gamma_H, \%data);
+                               $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
 
     # =========================================================================
     # MÉTODO 2 — Endpoint fijo
@@ -345,13 +339,13 @@ sub calcular ($self) {
         my ($bicarb2_mg, $carb2_mg, $oh2_mg) = _get_speciation($alk2 / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
         my $check2 = _get_criteria($alk2 / ALK_MEQ, $bicarb_vol2, $carb_vol2, 1,
                                    $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                                   $Kw, $K1, $K2, $gamma_H, \%data);
+                                   $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
 
         $resultado_fijo = {
             endpoint_carbonato_ph     => $carb_endpt2 + 0,
-            endpoint_carbonato_vol_ml => _r2($carb_vol2),
+            endpoint_carbonato_vol_ml => _r5($carb_vol2 / $cpm),
             endpoint_bicarbonato_ph   => $bicarb_endpt2 + 0,
-            endpoint_bicarbonato_vol_ml => _r2($bicarb_vol2),
+            endpoint_bicarbonato_vol_ml => _r5($bicarb_vol2 / $cpm),
             alcalinidad_mg_l          => _r1($alk2),
             alcalinidad_meq_l         => _r2($alk2 * 1000.0 / ALK_MEQ),
             bicarbonato_mg_l          => _r1($bicarb2_mg),
@@ -384,7 +378,7 @@ sub calcular ($self) {
         $GranF4_start = 10.3;
         $GranF4_end   = -0.5 * ($log10K1 + $log10K2) + 0.35;
 
-        # Estimar Ct para refinar regiones
+        # Estimar Ct para refinar regiones (igual que ac_calcs.pl)
         my ($Ct6, $use_defaults);
         if ($highest_ph > -1.0 * $log10K1 + 0.3) {
             $Ct6 = $bicarb1_mg / BICARB_MEQ + $carb1_mg / CARB_MEQ;
@@ -407,6 +401,24 @@ sub calcular ($self) {
                     $bicarb_ph_lower = $bep - 1.2;
                     $GranF1_start    = $bep - 0.35;
                     $GranF3_end      = $bep + 0.35;
+                }
+            }
+            # Refinar regiones de carbonato si Ct6 es baja
+            if ($Ct6 < $K1) {
+                $carb_ph_upper = 8.0;
+                $carb_ph_lower = 6.0;
+                $GranF2_start  = 6.65;
+                $GranF4_end    = 7.35;
+            } elsif ($Ct6 < $Kw / $K2) {
+                my $carb_endpt_H = ($Kw + sqrt($Kw*$Kw + 4.0*$Ct6*$Kw*$K1)) / (2.0*$Ct6);
+                if ($carb_endpt_H > 0.0) {
+                    my $cep = -log($carb_endpt_H) / log(10.0);
+                    if ($cep >= 7 && $cep <= -0.5*($log10K1 + $log10K2)) {
+                        $carb_ph_upper = $cep + 1.0;
+                        $carb_ph_lower = $cep - 1.0;
+                        $GranF2_start  = $cep - 0.35;
+                        $GranF4_end    = $cep + 0.35;
+                    }
                 }
             }
         }
@@ -447,7 +459,7 @@ sub calcular ($self) {
                 while ($ph >= $carb_ph_lower) {
                     my $H  = 10.0 ** (-$ph);
                     my $i  = sprintf("%.3f", $ph);
-                    $vol4{$i} = $_volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
+                    $vol4{$i} = $cpm * $volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
                                 * ($alk4 - $Ct4*($K1*$H + 2.0*$K1*$K2)/($H*$H + $K1*$H + $K1*$K2) - $Kw/$H + $H/$gamma_H);
                     $calc_slope4{$i} = ($lp - $ph) / ($vol4{$i} - $lv) if defined $lv;
                     $lv = $vol4{$i}; $lp = $ph;
@@ -496,7 +508,7 @@ sub calcular ($self) {
                 while ($ph >= $bicarb_ph_lower) {
                     my $H = 10.0 ** (-$ph);
                     my $i = sprintf("%.3f", $ph);
-                    $vol3{$i} = $_volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
+                    $vol3{$i} = $cpm * $volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
                                 * ($alk3 - $Ct3*($K1*$H + 2.0*$K1*$K2)/($H*$H + $K1*$H + $K1*$K2) - $Kw/$H + $H/$gamma_H);
                     $calc_slope3{$i} = ($lp - $ph) / ($vol3{$i} - $lv) if defined $lv;
                     $lv = $vol3{$i}; $lp = $ph;
@@ -515,12 +527,12 @@ sub calcular ($self) {
                 my ($b3, $c3, $oh3) = _get_speciation($alk3_tmp / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
                 my $check3 = _get_criteria($alk3_tmp / ALK_MEQ, $bicarb_endpt3_vol, $carb_endpt4_vol, 0,
                                            $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                                           $Kw, $K1, $K2, $gamma_H, \%data);
+                                           $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
                 $resultado_ctc1 = {
                     endpoint_carbonato_ph      => defined $carb_endpt4 ? $carb_endpt4 + 0 : undef,
-                    endpoint_carbonato_vol_ml  => _r2($carb_endpt4_vol),
+                    endpoint_carbonato_vol_ml  => _r5($carb_endpt4_vol / $cpm),
                     endpoint_bicarbonato_ph    => defined $bicarb_endpt3 ? $bicarb_endpt3 + 0 : undef,
-                    endpoint_bicarbonato_vol_ml => _r2($bicarb_endpt3_vol),
+                    endpoint_bicarbonato_vol_ml => _r5($bicarb_endpt3_vol / $cpm),
                     alcalinidad_mg_l           => _r1($alk3_tmp),
                     alcalinidad_meq_l          => _r2($alk3_tmp * 1000.0 / ALK_MEQ),
                     bicarbonato_mg_l           => _r1($b3),
@@ -563,10 +575,10 @@ sub calcular ($self) {
                 my ($lv, $lp);
                 my $start_ph = $highest_ph > $carb_ph_upper ? $highest_ph : $carb_ph_upper;
                 my $ph = $start_ph;
-                while ($ph >= $lowest_ph && $ph >= $bicarb_ph_lower) {
+                while ($ph >= $lowest_ph || $ph >= $bicarb_ph_lower) {
                     my $H = 10.0 ** (-$ph);
                     my $i = sprintf("%.3f", $ph);
-                    $vol5{$i} = $_volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
+                    $vol5{$i} = $cpm * $volume / ($acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H)
                                 * ($alk5 - $Ct5*($K1*$H + 2.0*$K1*$K2)/($H*$H + $K1*$H + $K1*$K2) - $Kw/$H + $H/$gamma_H);
                     $calc_slope5{$i} = ($lp - $ph) / ($vol5{$i} - $lv) if defined $lv;
                     $lv = $vol5{$i}; $lp = $ph;
@@ -603,14 +615,14 @@ sub calcular ($self) {
 
                 my $alk5_tmp = $bicarb_endpt5_vol * $F3 / $volume;
                 my ($b5, $c5, $oh5) = _get_speciation($alk5_tmp / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
-                my $check5 = _get_criteria($alk5_tmp / ALK_MEQ, $bicarb_endpt5_vol, $carb_endpt5_vol, 0,
+                my $check5 = _get_criteria($alk5_tmp / ALK_MEQ, $bicarb_endpt5_vol, ($carb_endpt5_vol // 0), 0,
                                            $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                                           $Kw, $K1, $K2, $gamma_H, \%data);
+                                           $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
                 $resultado_ctc2 = {
                     endpoint_carbonato_ph      => defined $carb_endpt5 ? $carb_endpt5 + 0 : undef,
-                    endpoint_carbonato_vol_ml  => _r2($carb_endpt5_vol),
+                    endpoint_carbonato_vol_ml  => _r5(($carb_endpt5_vol // 0) / $cpm),
                     endpoint_bicarbonato_ph    => defined $bicarb_endpt5 ? $bicarb_endpt5 + 0 : undef,
-                    endpoint_bicarbonato_vol_ml => _r2($bicarb_endpt5_vol),
+                    endpoint_bicarbonato_vol_ml => _r5(($bicarb_endpt5_vol // 0) / $cpm),
                     alcalinidad_mg_l           => _r1($alk5_tmp),
                     alcalinidad_meq_l          => _r2($alk5_tmp * 1000.0 / ALK_MEQ),
                     bicarbonato_mg_l           => _r1($b5),
@@ -629,104 +641,358 @@ sub calcular ($self) {
     }
 
     # =========================================================================
-    # MÉTODO 6 — Gran
+    # MÉTODO 6 — Gran (traducción COMPLETA de ac_calcs.pl, incluyendo F5, F6
+    #             y la lógica de bypass F1→F3 con refinamiento iterativo)
     # =========================================================================
     my $resultado_gran = undef;
 
     if ($do_gran) {
+        my ($GranF1_success, $GranF2_success, $GranF3_success) = (0, 0, 0);
+        my ($GranF4_success, $GranF5_success, $GranF6_success) = (0, 0, 0);
+        my ($GranF1_n, $GranF1_slope, $GranF1_int) = (0, 0, 0);
+        my ($GranF2_n, $GranF2_slope, $GranF2_int) = (0, 0, 0);
+        my ($GranF3_n, $GranF3_slope, $GranF3_int) = (0, 0, 0);
+        my ($GranF4_n, $GranF4_slope, $GranF4_int) = (0, 0, 0);
+        my ($GranF5_n, $GranF5_slope, $GranF5_int) = (0, 0, 0);
+        my ($GranF6_n, $GranF6_slope, $GranF6_int) = (0, 0, 0);
         my (%GranF1, %GranF2, %GranF3, %GranF4, %GranF5, %GranF6);
-        my (%regF1, %regF2, %regF3, %regF4, %regF5, %regF6);
-        my ($GranF1_n, $GranF1_slope, $GranF1_int);
-        my ($GranF2_n, $GranF2_slope, $GranF2_int);
-        my ($GranF3_n, $GranF3_slope, $GranF3_int);
-        my ($GranF4_n, $GranF4_slope, $GranF4_int);
-        my ($GranF5_n, $GranF5_slope, $GranF5_int);
-        my ($GranF6_n, $GranF6_slope, $GranF6_int);
+        my ($bicarb_endpt6_vol, $bicarb_endpt6b_vol) = (0, 0);
+        my ($carb_endpt6_vol, $carb_endpt6b_vol) = (0, 0);
+        my ($oh_endpt6_vol, $oh_endpt6b_vol) = (0, 0);
+        my ($alk6, $alk6b) = (0, 0);
+        my ($bicarb6_mg, $carb6_mg, $oh6_mg) = (0, 0, 0);
+        my ($bicarb6b_mg, $carb6b_mg) = (0, 0);
+        my ($check6, $check6b);
 
+        # =====================================================================
         # F1 — bicarbonato (pendiente positiva)
+        # =====================================================================
+        my (@Gran_arr, @reg_arr);
         foreach my $ph (reverse sort { $a <=> $b } keys %data) {
-            next if $ph > $ph_split;
-            my $GrF1 = ($volume + $data{$ph}) * 10.0 ** (-$ph) / $gamma_H;
-            $GranF1{$data{$ph}} = $GrF1;
-            $regF1{$data{$ph}}  = $GrF1 if $ph <= $GranF1_start;
+            next if ($ph > $ph_split);
+            my $GrF1 = ($volume + $data{$ph} / $cpm) * 10.0 ** (-$ph) / $gamma_H;
+            push @Gran_arr, $data{$ph}, $GrF1;
+            push @reg_arr,  $data{$ph}, $GrF1 if ($ph <= $GranF1_start);
         }
-        ($GranF1_n, $GranF1_slope, $GranF1_int) = _regression(%regF1);
-
-        my ($bicarb_endpt6_vol, $alk6, $bicarb6_mg, $carb6_mg, $oh6_mg);
-        my $GranF1_success = 0;
+        %GranF1 = @Gran_arr;
+        ($GranF1_n, $GranF1_slope, $GranF1_int) = _regression(@reg_arr);
 
         if ($GranF1_n > 1 && $GranF1_slope != 0) {
-            $bicarb_endpt6_vol = -$GranF1_int / $GranF1_slope;
+            $bicarb_endpt6_vol = -1.0 * $GranF1_int / $GranF1_slope;
             $GranF1_success    = 1;
             $alk6 = $bicarb_endpt6_vol * $F3 / $volume;
             ($bicarb6_mg, $carb6_mg, $oh6_mg) = _get_speciation($alk6 / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
 
             # F2 — carbonato usando endpoint de F1
+            @Gran_arr = ();
+            @reg_arr  = ();
             foreach my $ph (reverse sort { $a <=> $b } keys %data) {
-                last if $ph < $GranF2_end;
-                my $GrF2 = ($bicarb_endpt6_vol - $data{$ph}) * 10.0 ** (-$ph);
-                $GranF2{$data{$ph}} = $GrF2;
-                $regF2{$data{$ph}}  = $GrF2 if $ph <= $GranF2_start;
+                last if ($ph < $GranF2_end);
+                my $GrF2 = ($bicarb_endpt6_vol - $data{$ph}) / $cpm * 10.0 ** (-$ph);
+                push @Gran_arr, $data{$ph}, $GrF2;
+                push @reg_arr,  $data{$ph}, $GrF2 if ($ph <= $GranF2_start);
             }
-            ($GranF2_n, $GranF2_slope, $GranF2_int) = _regression(%regF2);
-        }
+            %GranF2 = @Gran_arr;
+            ($GranF2_n, $GranF2_slope, $GranF2_int) = _regression(@reg_arr);
 
-        my ($carb_endpt6_vol, $GranF2_success) = (0, 0);
-        if (($GranF2_n // 0) > 1 && ($GranF2_slope // 0) != 0) {
-            my $ep = -$GranF2_int / $GranF2_slope;
-            if ($ep > 0) { $carb_endpt6_vol = $ep; $GranF2_success = 1; }
-        }
-
-        # F3 — bicarbonato alternativo (pendiente negativa)
-        foreach my $ph (sort { $a <=> $b } keys %data) {
-            last if $ph > $GranF3_start;
-            my $GrF3 = ($data{$ph} - $carb_endpt6_vol) * 10.0 ** $ph;
-            $GranF3{$data{$ph}} = $GrF3;
-            $regF3{$data{$ph}}  = $GrF3 if $ph >= $GranF3_end;
-        }
-        ($GranF3_n, $GranF3_slope, $GranF3_int) = _regression(%regF3);
-
-        my ($bicarb_endpt6b_vol, $alk6b, $bicarb6b_mg, $carb6b_mg, $GranF3_success) = (0, 0, 0, 0, 0);
-        if ($GranF3_n > 1 && $GranF3_slope != 0) {
-            my $ep = -$GranF3_int / $GranF3_slope;
-            if ($ep > 0) {
-                $bicarb_endpt6b_vol = $ep;
-                $GranF3_success     = 1;
-                $alk6b = $bicarb_endpt6b_vol * $F3 / $volume;
-                ($bicarb6b_mg, $carb6b_mg) = _get_speciation($alk6b / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
+            if ($GranF2_n > 1 && $GranF2_slope != 0) {
+                my $ep = -1.0 * $GranF2_int / $GranF2_slope;
+                if ($ep > 0) {
+                    $carb_endpt6_vol = $ep;
+                    $GranF2_success  = 1;
+                }
             }
-        }
 
-        # F4 — carbonato alternativo (solo si F2 tuvo éxito)
-        my ($carb_endpt6b_vol, $GranF4_success) = (0, 0);
-        if ($GranF2_success) {
+            # Check for inconsistencies in results from F1 and F2
+            $check6 = _get_criteria($alk6 / ALK_MEQ, $bicarb_endpt6_vol, $carb_endpt6_vol, 0,
+                                    $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
+                                    $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
+
+            # F3 — bicarbonato alternativo (usando carb endpoint de F2)
+            @Gran_arr = ();
+            @reg_arr  = ();
             foreach my $ph (sort { $a <=> $b } keys %data) {
-                next if $ph < $ph_split;
-                last if $ph > $GranF4_start;
-                my $ref_vol = $GranF1_success ? $bicarb_endpt6_vol : $bicarb_endpt6b_vol;
-                my $GrF4 = ($ref_vol - 2.0 * $carb_endpt6_vol + $data{$ph}) * 10.0 ** $ph;
-                $GranF4{$data{$ph}} = $GrF4;
-                $regF4{$data{$ph}}  = $GrF4 if $ph >= $GranF4_end;
+                last if ($ph > $GranF3_start);
+                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                push @Gran_arr, $data{$ph}, $GrF3;
+                push @reg_arr,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
             }
-            ($GranF4_n, $GranF4_slope, $GranF4_int) = _regression(%regF4);
-            if ($GranF4_n > 1 && $GranF4_slope != 0) {
-                my $ep = -$GranF4_int / $GranF4_slope;
-                if ($ep > 0) { $carb_endpt6b_vol = $ep; $GranF4_success = 1; }
+            %GranF3 = @Gran_arr;
+            ($GranF3_n, $GranF3_slope, $GranF3_int) = _regression(@reg_arr);
+
+            if ($GranF3_n > 1 && $GranF3_slope != 0) {
+                my $ep = -1.0 * $GranF3_int / $GranF3_slope;
+                if ($ep > 0) {
+                    $bicarb_endpt6b_vol = $ep;
+                    $GranF3_success     = 1;
+                    $alk6b = $bicarb_endpt6b_vol * $F3 / $volume;
+                    ($bicarb6b_mg, $carb6b_mg) = _get_speciation($alk6b / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
+
+                    $check6b = _get_criteria($alk6b / ALK_MEQ, $bicarb_endpt6b_vol, $carb_endpt6_vol, 0,
+                                             $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
+                                             $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
+                }
+            }
+
+            # F4 — carbonato alternativo (solo si F2 tuvo éxito)
+            if ($GranF2_success) {
+                @Gran_arr = ();
+                @reg_arr  = ();
+                foreach my $ph (sort { $a <=> $b } keys %data) {
+                    next if ($ph < $ph_split);
+                    last if ($ph > $GranF4_start);
+                    my $GrF4 = ($bicarb_endpt6_vol - 2.0 * $carb_endpt6_vol + $data{$ph})
+                               / $cpm * 10.0 ** $ph;
+                    push @Gran_arr, $data{$ph}, $GrF4;
+                    push @reg_arr,  $data{$ph}, $GrF4 if ($ph >= $GranF4_end);
+                }
+                %GranF4 = @Gran_arr;
+                ($GranF4_n, $GranF4_slope, $GranF4_int) = _regression(@reg_arr);
+
+                if ($GranF4_n > 1 && $GranF4_slope != 0) {
+                    my $ep = -1.0 * $GranF4_int / $GranF4_slope;
+                    if ($ep > 0) { $carb_endpt6b_vol = $ep; $GranF4_success = 1; }
+                }
+
+                # F5 — hidróxido (solo si F2 tuvo éxito)
+                my $oh_endpt_vol = 2.0 * $carb_endpt6_vol - $bicarb_endpt6_vol;
+                if ($oh_endpt_vol > 0.0 && $carb_endpt6_vol > 0.0 && $bicarb_endpt6_vol > $carb_endpt6_vol) {
+                    # Interpolar pH del OH endpoint
+                    $last_vol = $data{$highest_ph};
+                    my $oh_endpt_ph = $highest_ph;
+                    my $lp2 = $highest_ph;
+                    foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                        if ($data{$ph} >= $oh_endpt_vol && $last_vol < $oh_endpt_vol) {
+                            $oh_endpt_ph = $lp2 + ($ph - $lp2) * ($oh_endpt_vol - $last_vol) / ($data{$ph} - $last_vol);
+                            last;
+                        }
+                        $last_vol = $data{$ph};
+                        $lp2 = $ph;
+                    }
+                    $GranF5_start = $oh_endpt_ph - 0.35;
+                    $GranF6_end   = $oh_endpt_ph + 0.35;
+
+                    @Gran_arr = ();
+                    @reg_arr  = ();
+                    foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                        last if ($ph < $GranF4_end);
+                        my $GrF5 = ($carb_endpt6_vol - $data{$ph}) / $cpm * 10.0 ** (-$ph);
+                        push @Gran_arr, $data{$ph}, $GrF5;
+                        push @reg_arr,  $data{$ph}, $GrF5 if ($ph <= $GranF5_start);
+                    }
+                    %GranF5 = @Gran_arr;
+                    ($GranF5_n, $GranF5_slope, $GranF5_int) = _regression(@reg_arr);
+
+                    if ($GranF5_n > 1 && $GranF5_slope != 0) {
+                        $oh_endpt6_vol = -1.0 * $GranF5_int / $GranF5_slope;
+                        if ($oh_endpt6_vol > 0 && $oh_endpt6_vol < $carb_endpt6_vol) {
+                            $GranF5_success = 1;
+                        } else {
+                            $oh_endpt6_vol = 0;
+                        }
+                    }
+
+                    # F6
+                    @Gran_arr = ();
+                    @reg_arr  = ();
+                    foreach my $ph (sort { $a <=> $b } keys %data) {
+                        next if ($ph < $GranF4_end);
+                        my $GrF6 = ($volume + $data{$ph} / $cpm) * 10.0 ** $ph;
+                        push @Gran_arr, $data{$ph}, $GrF6;
+                        push @reg_arr,  $data{$ph}, $GrF6 if ($ph >= $GranF6_end);
+                    }
+                    %GranF6 = @Gran_arr;
+                    ($GranF6_n, $GranF6_slope, $GranF6_int) = _regression(@reg_arr);
+
+                    if ($GranF6_n > 1 && $GranF6_slope != 0) {
+                        $oh_endpt6b_vol = -1.0 * $GranF6_int / $GranF6_slope;
+                        if ($oh_endpt6b_vol > 0 && $oh_endpt6b_vol < $carb_endpt6_vol) {
+                            $GranF6_success = 1;
+                        } else {
+                            $oh_endpt6b_vol = 0;
+                        }
+                    }
+                }
+            }
+
+        }
+        # =====================================================================
+        # Si F1 falló (< 2 puntos), bypass con F3 y refinamiento iterativo
+        # (traducción literal del bloque "if ($GranF1_n < 2)" de ac_calcs.pl)
+        # =====================================================================
+        if ($GranF1_n < 2) {
+            $carb_endpt6_vol = 0 if (!defined $carb_endpt6_vol || !$carb_endpt6_vol);
+
+            # F3 sin endpoint de carbonato conocido
+            @Gran_arr = ();
+            @reg_arr  = ();
+            foreach my $ph (sort { $a <=> $b } keys %data) {
+                last if ($ph > $GranF3_start);
+                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                push @Gran_arr, $data{$ph}, $GrF3;
+                push @reg_arr,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
+            }
+            %GranF3 = @Gran_arr;
+            ($GranF3_n, $GranF3_slope, $GranF3_int) = _regression(@reg_arr);
+
+            if ($GranF3_n > 1 && $GranF3_slope != 0) {
+                my $ep = -1.0 * $GranF3_int / $GranF3_slope;
+                if ($ep > 0) {
+                    $bicarb_endpt6b_vol = $ep;
+                    $GranF3_success     = 1;
+                    $alk6b = $bicarb_endpt6b_vol * $F3 / $volume;
+
+                    # F2 usando resultado de F3
+                    @Gran_arr = ();
+                    @reg_arr  = ();
+                    foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                        last if ($ph < $GranF2_end);
+                        my $GrF2 = ($bicarb_endpt6b_vol - $data{$ph}) / $cpm * 10.0 ** (-$ph);
+                        push @Gran_arr, $data{$ph}, $GrF2;
+                        push @reg_arr,  $data{$ph}, $GrF2 if ($ph <= $GranF2_start);
+                    }
+                    %GranF2 = @Gran_arr;
+                    ($GranF2_n, $GranF2_slope, $GranF2_int) = _regression(@reg_arr);
+
+                    if ($GranF2_n > 1 && $GranF2_slope != 0) {
+                        my $ep2 = -1.0 * $GranF2_int / $GranF2_slope;
+                        if ($ep2 > 0) {
+                            $carb_endpt6_vol = $ep2;
+                            $GranF2_success  = 1;
+
+                            # Refinar F3 con el nuevo carb endpoint
+                            my (@new_Gran, @new_reg);
+                            foreach my $ph (sort { $a <=> $b } keys %data) {
+                                last if ($ph > $GranF3_start);
+                                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                                push @new_Gran, $data{$ph}, $GrF3;
+                                push @new_reg,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
+                            }
+                            my ($nn, $ns, $ni) = _regression(@new_reg);
+                            if ($nn > 1 && $ns != 0) {
+                                my $new_ep = -1.0 * $ni / $ns;
+                                if ($new_ep > 0) {
+                                    %GranF3 = @new_Gran;
+                                    $GranF3_n = $nn; $GranF3_slope = $ns; $GranF3_int = $ni;
+                                    $bicarb_endpt6b_vol = $new_ep;
+                                    $alk6b = $bicarb_endpt6b_vol * $F3 / $volume;
+
+                                    # Refinar F2 con resultado actualizado de F3
+                                    my (@new2_Gran, @new2_reg);
+                                    foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                                        last if ($ph < $GranF2_end);
+                                        my $GrF2 = ($bicarb_endpt6b_vol - $data{$ph}) / $cpm * 10.0 ** (-$ph);
+                                        push @new2_Gran, $data{$ph}, $GrF2;
+                                        push @new2_reg,  $data{$ph}, $GrF2 if ($ph <= $GranF2_start);
+                                    }
+                                    my ($nn2, $ns2, $ni2) = _regression(@new2_reg);
+                                    if ($nn2 > 1 && $ns2 != 0) {
+                                        my $new_ep2 = -1.0 * $ni2 / $ns2;
+                                        if ($new_ep2 > 0) {
+                                            %GranF2 = @new2_Gran;
+                                            $GranF2_n = $nn2; $GranF2_slope = $ns2; $GranF2_int = $ni2;
+                                            $carb_endpt6_vol = $new_ep2;
+                                        }
+                                    }
+                                }
+                            }
+
+                            # F4 usando F2 y F3
+                            @Gran_arr = ();
+                            @reg_arr  = ();
+                            foreach my $ph (sort { $a <=> $b } keys %data) {
+                                next if ($ph < $ph_split);
+                                last if ($ph > $GranF4_start);
+                                my $GrF4 = ($bicarb_endpt6b_vol - 2.0 * $carb_endpt6_vol + $data{$ph})
+                                           / $cpm * 10.0 ** $ph;
+                                push @Gran_arr, $data{$ph}, $GrF4;
+                                push @reg_arr,  $data{$ph}, $GrF4 if ($ph >= $GranF4_end);
+                            }
+                            %GranF4 = @Gran_arr;
+                            ($GranF4_n, $GranF4_slope, $GranF4_int) = _regression(@reg_arr);
+
+                            if ($GranF4_n > 1 && $GranF4_slope != 0) {
+                                my $ep4 = -1.0 * $GranF4_int / $GranF4_slope;
+                                if ($ep4 > 0) { $carb_endpt6b_vol = $ep4; $GranF4_success = 1; }
+                            }
+
+                            # F5 y F6 (bypass path)
+                            my $oh_endpt_vol = 2.0 * $carb_endpt6_vol - $bicarb_endpt6b_vol;
+                            if ($oh_endpt_vol > 0.0 && $carb_endpt6_vol > 0.0 && $bicarb_endpt6b_vol > $carb_endpt6_vol) {
+                                $last_vol = $data{$highest_ph};
+                                my $oh_endpt_ph = $highest_ph;
+                                my $lp2 = $highest_ph;
+                                foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                                    if ($data{$ph} >= $oh_endpt_vol && $last_vol < $oh_endpt_vol) {
+                                        $oh_endpt_ph = $lp2 + ($ph - $lp2) * ($oh_endpt_vol - $last_vol) / ($data{$ph} - $last_vol);
+                                        last;
+                                    }
+                                    $last_vol = $data{$ph};
+                                    $lp2 = $ph;
+                                }
+                                $GranF5_start = $oh_endpt_ph - 0.35;
+                                $GranF6_end   = $oh_endpt_ph + 0.35;
+
+                                @Gran_arr = ();
+                                @reg_arr  = ();
+                                foreach my $ph (reverse sort { $a <=> $b } keys %data) {
+                                    last if ($ph < $GranF4_end);
+                                    my $GrF5 = ($carb_endpt6_vol - $data{$ph}) / $cpm * 10.0 ** (-$ph);
+                                    push @Gran_arr, $data{$ph}, $GrF5;
+                                    push @reg_arr,  $data{$ph}, $GrF5 if ($ph <= $GranF5_start);
+                                }
+                                %GranF5 = @Gran_arr;
+                                ($GranF5_n, $GranF5_slope, $GranF5_int) = _regression(@reg_arr);
+
+                                if ($GranF5_n > 1 && $GranF5_slope != 0) {
+                                    $oh_endpt6_vol = -1.0 * $GranF5_int / $GranF5_slope;
+                                    if ($oh_endpt6_vol > 0 && $oh_endpt6_vol < $carb_endpt6_vol) {
+                                        $GranF5_success = 1;
+                                    } else {
+                                        $oh_endpt6_vol = 0;
+                                    }
+                                }
+
+                                @Gran_arr = ();
+                                @reg_arr  = ();
+                                foreach my $ph (sort { $a <=> $b } keys %data) {
+                                    next if ($ph < $GranF4_end);
+                                    my $GrF6 = ($volume + $data{$ph} / $cpm) * 10.0 ** $ph;
+                                    push @Gran_arr, $data{$ph}, $GrF6;
+                                    push @reg_arr,  $data{$ph}, $GrF6 if ($ph >= $GranF6_end);
+                                }
+                                %GranF6 = @Gran_arr;
+                                ($GranF6_n, $GranF6_slope, $GranF6_int) = _regression(@reg_arr);
+
+                                if ($GranF6_n > 1 && $GranF6_slope != 0) {
+                                    $oh_endpt6b_vol = -1.0 * $GranF6_int / $GranF6_slope;
+                                    if ($oh_endpt6b_vol > 0 && $oh_endpt6b_vol < $carb_endpt6_vol) {
+                                        $GranF6_success = 1;
+                                    } else {
+                                        $oh_endpt6b_vol = 0;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    # Recalcular especiación F3
+                    ($bicarb6b_mg, $carb6b_mg) = _get_speciation($alk6b / ALK_MEQ, $highest_ph, $Kw, $K1, $K2, $gamma_H);
+                    $check6b = _get_criteria($alk6b / ALK_MEQ, $bicarb_endpt6b_vol, $carb_endpt6_vol, 0,
+                                             $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
+                                             $Kw, $K1, $K2, $gamma_H, \%data, $cpm);
+                }
             }
         }
 
-        my $check6  = $GranF1_success ? _get_criteria($alk6  / ALK_MEQ, $bicarb_endpt6_vol,  $carb_endpt6_vol,  0,
-                                                       $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                                                       $Kw, $K1, $K2, $gamma_H, \%data) : undef;
-        my $check6b = $GranF3_success ? _get_criteria($alk6b / ALK_MEQ, $bicarb_endpt6b_vol, $carb_endpt6_vol,  0,
-                                                       $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-                                                       $Kw, $K1, $K2, $gamma_H, \%data) : undef;
-
+        # =====================================================================
+        # Armar respuesta Gran
+        # =====================================================================
         $resultado_gran = {
             F1 => {
                 exito                       => $GranF1_success ? \1 : \0,
                 puntos_usados               => $GranF1_n + 0,
-                endpoint_bicarbonato_vol_ml => $GranF1_success ? _r2($bicarb_endpt6_vol) : undef,
+                endpoint_bicarbonato_vol_ml => $GranF1_success ? _r5($bicarb_endpt6_vol / $cpm) : undef,
                 alcalinidad_mg_l            => $GranF1_success ? _r1($alk6)  : undef,
                 alcalinidad_meq_l           => $GranF1_success ? _r2($alk6 * 1000.0 / ALK_MEQ) : undef,
                 bicarbonato_mg_l            => $GranF1_success ? _r1($bicarb6_mg) : undef,
@@ -737,12 +1003,12 @@ sub calcular ($self) {
             F2 => {
                 exito                      => $GranF2_success ? \1 : \0,
                 puntos_usados              => ($GranF2_n // 0) + 0,
-                endpoint_carbonato_vol_ml  => $GranF2_success ? _r2($carb_endpt6_vol) : undef,
+                endpoint_carbonato_vol_ml  => $GranF2_success ? _r5($carb_endpt6_vol / $cpm) : undef,
             },
             F3 => {
                 exito                       => $GranF3_success ? \1 : \0,
                 puntos_usados               => $GranF3_n + 0,
-                endpoint_bicarbonato_vol_ml => $GranF3_success ? _r2($bicarb_endpt6b_vol) : undef,
+                endpoint_bicarbonato_vol_ml => $GranF3_success ? _r5($bicarb_endpt6b_vol / $cpm) : undef,
                 alcalinidad_mg_l            => $GranF3_success ? _r1($alk6b) : undef,
                 alcalinidad_meq_l           => $GranF3_success ? _r2($alk6b * 1000.0 / ALK_MEQ) : undef,
                 bicarbonato_mg_l            => $GranF3_success ? _r1($bicarb6b_mg) : undef,
@@ -752,7 +1018,17 @@ sub calcular ($self) {
             F4 => {
                 exito                     => $GranF4_success ? \1 : \0,
                 puntos_usados             => ($GranF4_n // 0) + 0,
-                endpoint_carbonato_vol_ml => $GranF4_success ? _r2($carb_endpt6b_vol) : undef,
+                endpoint_carbonato_vol_ml => $GranF4_success ? _r5($carb_endpt6b_vol / $cpm) : undef,
+            },
+            F5 => {
+                exito                     => $GranF5_success ? \1 : \0,
+                puntos_usados             => ($GranF5_n // 0) + 0,
+                endpoint_hidroxido_vol_ml => $GranF5_success ? _r5($oh_endpt6_vol / $cpm) : undef,
+            },
+            F6 => {
+                exito                     => $GranF6_success ? \1 : \0,
+                puntos_usados             => ($GranF6_n // 0) + 0,
+                endpoint_hidroxido_vol_ml => $GranF6_success ? _r5($oh_endpt6b_vol / $cpm) : undef,
             },
         };
     }
@@ -764,9 +1040,9 @@ sub calcular ($self) {
     if ($do_inflexion) {
         $resultado_inflexion = {
             endpoint_carbonato_ph      => defined $carb_endpt1 ? $carb_endpt1 + 0 : undef,
-            endpoint_carbonato_vol_ml  => _r2($carb_endpt1_vol),
+            endpoint_carbonato_vol_ml  => _r5($carb_endpt1_vol / $cpm),
             endpoint_bicarbonato_ph    => defined $bicarb_endpt1 ? $bicarb_endpt1 + 0 : undef,
-            endpoint_bicarbonato_vol_ml => _r2($bicarb_endpt1_vol),
+            endpoint_bicarbonato_vol_ml => _r5($bicarb_endpt1_vol / $cpm),
             alcalinidad_mg_l           => _r1($alk1),
             alcalinidad_meq_l          => _r2($alk1 * 1000.0 / ALK_MEQ),
             bicarbonato_mg_l           => _r1($bicarb1_mg),
@@ -802,41 +1078,39 @@ sub calcular ($self) {
     my (@g_ctc1_curva, @g_ctc1_pendiente);
     if ($do_ctc && $resultado_ctc1 && !exists $resultado_ctc1->{error}
         && defined $resultado_ctc1->{endpoint_bicarbonato_vol_ml}) {
-        if (1) {
-            my $ep_vol = $resultado_ctc1->{endpoint_bicarbonato_vol_ml};
-            my $alk3_r = $ep_vol * $F3 / $volume;
-            my $H0     = 10.0 ** (-$highest_ph);
-            my $Ct3_r  = ($alk3_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
-                         * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
-            my ($lv2, $lp2);
-            my $_phi_hi3 = $bicarb_ph_upper < $highest_ph ? $bicarb_ph_upper : $highest_ph;
-            my $_phi_lo3 = $bicarb_ph_lower > $lowest_ph  ? $bicarb_ph_lower : $lowest_ph;
-            my $ph = $_phi_hi3;
-            while ($ph >= $_phi_lo3 - 0.001) {
-                my $H   = 10.0 ** (-$ph);
-                my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
-                if ($den) {
-                    my $v = $volume / $den
-                            * ($alk3_r / ALK_MEQ
-                               - $Ct3_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
-                               - $Kw/$H + $H/$gamma_H);
-                    push @g_ctc1_curva, { x => _r2($v), ph => _r2($ph) };
-                    if (defined $lv2 && abs($v - $lv2) > 1e-10) {
-                        push @g_ctc1_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2(($lp2 - $ph) / ($v - $lv2)) };
-                    }
-                    $lv2 = $v; $lp2 = $ph;
+        my $ep_vol = $resultado_ctc1->{endpoint_bicarbonato_vol_ml};
+        my $alk3_r = $ep_vol * $F3_ml / $volume;
+        my $H0     = 10.0 ** (-$highest_ph);
+        my $Ct3_r  = ($alk3_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
+                     * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
+        my ($lv2, $lp2);
+        my $_phi_hi3 = $bicarb_ph_upper < $highest_ph ? $bicarb_ph_upper : $highest_ph;
+        my $_phi_lo3 = $bicarb_ph_lower > $lowest_ph  ? $bicarb_ph_lower : $lowest_ph;
+        my $ph = $_phi_hi3;
+        while ($ph >= $_phi_lo3 - 0.001) {
+            my $H   = 10.0 ** (-$ph);
+            my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
+            if ($den) {
+                my $v = $volume / $den
+                        * ($alk3_r / ALK_MEQ
+                           - $Ct3_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
+                           - $Kw/$H + $H/$gamma_H);
+                push @g_ctc1_curva, { x => _r2($v), ph => _r2($ph) };
+                if (defined $lv2 && abs($v - $lv2) > 1e-10) {
+                    push @g_ctc1_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2(($lp2 - $ph) / ($v - $lv2)) };
                 }
-                $ph -= 0.01;
+                $lv2 = $v; $lp2 = $ph;
             }
+            $ph -= 0.01;
         }
     }
 
-    # --- Gráfica 3: Curva teórica CTC-2 (ajuste curva completa) ---
+    # --- Gráfica 3: Curva teórica CTC-2 ---
     my (@g_ctc2_curva, @g_ctc2_pendiente);
     if ($do_ctc && $resultado_ctc2 && !exists $resultado_ctc2->{error}) {
         if (defined $resultado_ctc2->{endpoint_bicarbonato_vol_ml}) {
             my $ep_vol = $resultado_ctc2->{endpoint_bicarbonato_vol_ml};
-            my $alk5_r = $ep_vol * $F3 / $volume;
+            my $alk5_r = $ep_vol * $F3_ml / $volume;
             my $H0     = 10.0 ** (-$highest_ph);
             my $Ct5_r  = ($alk5_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
                          * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
@@ -853,8 +1127,8 @@ sub calcular ($self) {
                                - $Kw/$H + $H/$gamma_H);
                     push @g_ctc2_curva, { x => _r2($v), ph => _r2($ph) };
                     if (defined $lv2) {
-                        my $s = ($lp2 - $ph) / ($v - $lv2) if abs($v - $lv2) > 1e-10;
-                        push @g_ctc2_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2($s // 0) };
+                        my $s = abs($v - $lv2) > 1e-10 ? ($lp2 - $ph) / ($v - $lv2) : 0;
+                        push @g_ctc2_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2($s) };
                     }
                     $lv2 = $v; $lp2 = $ph;
                 }
@@ -864,27 +1138,25 @@ sub calcular ($self) {
     }
 
     # --- Gráfica 4: Funciones Gran ---
-    my (%g_gran_F1, %g_gran_F2, %g_gran_F3, %g_gran_F4);
-    my (@g_F1, @g_F2, @g_F3, @g_F4);
+    my (@g_F1, @g_F2, @g_F3, @g_F4, @g_F5, @g_F6);
     if ($do_gran && $resultado_gran) {
         my $bicarb_ep = $resultado_gran->{F1}{endpoint_bicarbonato_vol_ml} // 0;
         my $carb_ep   = $resultado_gran->{F2}{endpoint_carbonato_vol_ml}  // 0;
+        my $bicarb_ep_counts = $bicarb_ep * $cpm;
+        my $carb_ep_counts   = $carb_ep   * $cpm;
 
         foreach my $ph (reverse sort { $a <=> $b } keys %data) {
             my $H = 10.0 ** (-$ph);
-            # F1
             if ($ph <= $ph_split) {
-                my $gf1 = ($volume + $data{$ph}) * $H / $gamma_H;
+                my $gf1 = ($volume + $data{$ph} / $cpm) * $H / $gamma_H;
                 push @g_F1, { x => $data{$ph} + 0, y => $gf1 + 0 };
             }
-            # F2 — solo si F1 tuvo éxito
             if ($bicarb_ep > 0) {
-                my $gf2 = ($bicarb_ep - $data{$ph}) * $H;
+                my $gf2 = ($bicarb_ep_counts - $data{$ph}) / $cpm * $H;
                 push @g_F2, { x => $data{$ph} + 0, y => $gf2 + 0 };
             }
-            # F3
             if ($carb_ep >= 0) {
-                my $gf3 = ($data{$ph} - $carb_ep) * (10.0 ** $ph);
+                my $gf3 = ($data{$ph} / $cpm - $carb_ep) * (10.0 ** $ph);
                 push @g_F3, { x => $data{$ph} + 0, y => $gf3 + 0 };
             }
         }
@@ -893,7 +1165,7 @@ sub calcular ($self) {
     # =========================================================================
     # Respuesta final
     # =========================================================================
-    alarm(0); # cancelar el alarm antes de responder
+    alarm(0);
     return $self->render(json => {
         constantes => {
             log10_Kw      => _r2($log10Kw),
@@ -982,7 +1254,8 @@ sub _get_speciation {
 sub _get_criteria {
     my ($alk, $bicarb_endpt_vol, $carb_endpt_vol, $endpt_fixed,
         $highest_ph, $volume, $acid_conc, $cor_factor, $F1, $F3,
-        $Kw, $K1, $K2, $gamma_H, $data_ref) = @_;
+        $Kw, $K1, $K2, $gamma_H, $data_ref, $cpm_arg) = @_;
+    $cpm_arg //= 1.0;
 
     my $H0       = 10.0 ** (-$highest_ph);
     my $n        = 0;
@@ -993,37 +1266,34 @@ sub _get_criteria {
         next if $H == 0.0;
         my $denom = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
         next unless $denom;
-        my $alpha0 = ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2);
-        my $alpha0_0 = ($K1*$H0 + 2.0*$K1*$K2) / ($H0*$H0 + $K1*$H0 + $K1*$K2);
-        my $vol_teo = $volume / $denom
-                      * ($alk - $Kw/$H + $H/$gamma_H
-                         - ($alk - $Kw/$H0 + $H0/$gamma_H) * $alpha0
-                         * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2));
+        my $vol = $cpm_arg * $volume / $denom
+                  * ($alk - $Kw/$H + $H/$gamma_H
+                     - ($alk - $Kw/$H0 + $H0/$gamma_H)
+                     * (($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2))
+                     * (($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2)));
         $n++;
-        $mean_err += abs($data_ref->{$ph} - $vol_teo);
+        $mean_err += abs($data_ref->{$ph} - $vol);
     }
     $mean_err /= $n if $n;
 
-    my $denom_check = $acid_conc * $cor_factor;
-    my $check_vol = $denom_check > 0
-        ? $volume / $denom_check
-          * ($alk - ($alk - $Kw/$H0 + $H0/$gamma_H) * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2))
-        : 0;
-
+    my $check_vol = $cpm_arg * $volume / ($acid_conc * $cor_factor)
+                    * ($alk - ($alk - $Kw/$H0 + $H0/$gamma_H)
+                    * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2));
     my $carb_vol_err = abs($carb_endpt_vol - $check_vol);
+
     my ($str1, $str2) = ('', '');
 
     if ($highest_ph > 8.3 && $carb_endpt_vol > 0 &&
         $carb_vol_err > 0.05 * $bicarb_endpt_vol &&
         $carb_endpt_vol > 0 && $bicarb_endpt_vol > 0 &&
         $carb_vol_err * $F1 / $volume > 1.0) {
-        $str1 = sprintf('El endpoint de carbonato encontrado (%.2f mL) no coincide bien con el teórico (%.2f mL). ',
+        $str1 = sprintf('El endpoint de carbonato encontrado (%.2f) no coincide bien con el teórico (%.2f). ',
                         $carb_endpt_vol, $check_vol);
     }
 
     if ($n > 10 && $bicarb_endpt_vol > 0 && $mean_err > 0.05 * $bicarb_endpt_vol && $mean_err * $F3 / $volume > 1.0) {
         $str2 = ($str1 ? 'Además, la ' : 'La ')
-              . sprintf('curva teórica de carbonatos (alcalinidad %.2f meq/L, pH %.2f) no ajusta bien a los datos (error medio = %.2f mL). ',
+              . sprintf('curva teórica de carbonatos (alcalinidad %.2f meq/L, pH %.2f) no ajusta bien a los datos (error medio = %.2f). ',
                         $alk * 1000.0, $highest_ph, $mean_err);
     }
 
@@ -1225,7 +1495,7 @@ sub _get_func {
         next if $H == 0.0;
         my $denom = $_acid_conc * $_cor_factor + $_Kw/$H - $H/$_gamma_H;
         next unless $denom;
-        my $vol = $_volume / $denom
+        my $vol = $_cpm * $_volume / $denom
                   * ($alk - $Ct*($_K1*$H + 2.0*$_K1*$_K2)/($H*$H + $_K1*$H + $_K1*$_K2)
                      - $_Kw/$H + $H/$_gamma_H);
         $sum += ($vol - $_data{$ph}) ** 2;
@@ -1234,20 +1504,23 @@ sub _get_func {
 }
 
 # --- Regresión lineal ponderada (regression) ---------------------------------
+# Traducción literal de ac_calcs.pl: recibe @xy como lista plana (x0,y0,x1,y1,...)
 sub _regression {
-    my %xy = @_;
+    my @xy = @_;
     my (@x, @y);
-    for my $xv (sort { $a <=> $b } keys %xy) {
-        push @x, $xv;
-        push @y, $xy{$xv};
+
+    my $n_total = ($#xy + 1) / 2;
+    return (0, 0, 0) if $n_total < 2;
+
+    for my $i (0..$n_total-1) {
+        $x[$i] = $xy[2 * $i];
+        $y[$i] = $xy[2 * $i + 1];
     }
-    my $n = scalar @x;
-    return (0, 0, 0) if $n < 2;
 
-    my ($last_slope, $last_int, $last_r2, $last_endpt) = (0, 0, 0, 0.0001);
+    my $n = $n_total + 1;
     my $done = 0;
+    my ($last_slope, $last_int, $last_r2, $last_endpt) = (0, 0, 0, 0.0001);
 
-    $n++;
     while (!$done) {
         $n--;
         last if $n < 2;
@@ -1283,5 +1556,7 @@ sub _sign { $_[1] >= 0 ? abs($_[0]) : -abs($_[0]) }
 sub _max  { $_[0] >= $_[1] ? $_[0] : $_[1] }
 sub _r1   { sprintf("%.1f", $_[0] // 0) + 0 }
 sub _r2   { sprintf("%.2f", $_[0] // 0) + 0 }
+sub _r4   { sprintf("%.4f", $_[0] // 0) + 0 }
+sub _r5   { sprintf("%.5f", $_[0] // 0) + 0 }
 
 1;

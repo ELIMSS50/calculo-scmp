@@ -95,14 +95,19 @@ Ejecuta los cálculos de alcalinidad sobre una curva de titulación.
 ### Con Docker
 ```bash
 sudo docker build -t calculo-scmp .
-sudo docker run -d --name calculo-scmp -p 3000:3000 calculo-scmp
+docker run -d -p 3000:3000 --name calculo-scmp calculo-scmp
 ```
 
-### Sin Docker
+## Ejecucion con el contenedor ya contruido
+
+### Con Docker
 ```bash
-cpanm --installdeps .
-perl script/calculo_scmp daemon -l http://*:3000
+sudo docker start calculo-scmp
+
+Para detenerlo
+sudo docker stop calculo-scmp
 ```
+
 
 ## Prueba rápida
 

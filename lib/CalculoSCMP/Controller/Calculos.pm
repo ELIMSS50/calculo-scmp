@@ -35,6 +35,7 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 # =============================================================================
 
 use POSIX qw();
+use Time::HiRes qw(time);
 
 # Pesos moleculares ×1000 — mismos valores que ac_calcs.pl
 use constant CARB_MEQ   => 60009.2;
@@ -42,23 +43,22 @@ use constant BICARB_MEQ => 61017.1;
 use constant ALK_MEQ    => 50043.6;
 use constant OH_MEQ     => 17007.3;
 
-# Variables de estado del optimizador (equivalentes a globals de ac_calcs.pl)
-my (@_pcom, @_xicom);
-my (%_data, $_highest_ph, $_lowest_ph, %_slope);
-my ($_Kw, $_K1, $_K2, $_gamma_H);
-my ($_volume, $_acid_conc, $_cor_factor, $_cpm);
-my ($_do_carb, $_do_bicarb);
-my ($_carb_ph_upper, $_carb_ph_lower, $_bicarb_ph_upper, $_bicarb_ph_lower);
+# Tiempo máximo (segundos) para cualquier optimización Powell. Se aplica como
+# deadline cooperativo (el optimizador chequea la wall-clock cada iteración),
+# en vez de SIGALRM que es a nivel de proceso y peligroso bajo concurrencia.
+use constant POWELL_DEADLINE_S => 8.0;
 
 # ---------------------------------------------------------------------------
 # POST /calcular
+#
+# IMPORTANTE: este handler NO usa estado a nivel de paquete (variables `my`
+# a nivel de archivo). Todo el estado del optimizador se construye en un
+# hashref local ($ctx) y se pasa explícitamente. Esto hace seguro correr
+# cálculos simultáneos dentro de un mismo worker de Hypnotoad y elimina
+# cualquier "fuga" de datos entre requests.
 # ---------------------------------------------------------------------------
 sub calcular ($self) {
     my $p = $self->req->json;
-
-    # Timeout de seguridad: 30 segundos máximo para todo el cálculo
-    local $SIG{ALRM} = sub { die "timeout\n" };
-    alarm(30);
 
     # --- Validación básica del body ---
     unless (defined $p && ref $p eq 'HASH') {
@@ -172,16 +172,29 @@ sub calcular ($self) {
     # devuelve endpoints en mL (calculados con la ecuación termodinámica).
     my $F3_ml = ALK_MEQ * $acid_conc * $cor_factor;
 
-    # Guardar estado global para el optimizador
-    %_data       = %data;
-    $_highest_ph = $highest_ph;
-    $_lowest_ph  = $lowest_ph;
-    %_slope      = %slope;
-    $_Kw         = $Kw;  $_K1 = $K1;  $_K2 = $K2;  $_gamma_H = $gamma_H;
-    $_volume     = $volume;
-    $_acid_conc  = $acid_conc;
-    $_cor_factor = $cor_factor;
-    $_cpm        = $cpm;
+    # Contexto LOCAL del optimizador. Se pasa por referencia a _powell y sus
+    # subrutinas en vez de usar variables a nivel de paquete. Esto aísla
+    # completamente cada cálculo de los demás (no globals → no race conditions).
+    my $ctx = {
+        data        => \%data,
+        highest_ph  => $highest_ph,
+        lowest_ph   => $lowest_ph,
+        slope       => \%slope,
+        Kw          => $Kw,
+        K1          => $K1,
+        K2          => $K2,
+        gamma_H     => $gamma_H,
+        volume      => $volume,
+        acid_conc   => $acid_conc,
+        cor_factor  => $cor_factor,
+        cpm         => $cpm,
+        do_carb     => 0,
+        do_bicarb   => 0,
+        deadline    => time() + POWELL_DEADLINE_S,
+        # estado interno de linmin/mnbrak/brent/onedim:
+        pcom        => [],
+        xicom       => [],
+    };
 
     # Verificar que la titulación llega suficientemente abajo
     if ($lowest_ph >= $ph_split && ($do_inflexion || $do_fixed)) {
@@ -423,16 +436,17 @@ sub calcular ($self) {
             }
         }
 
-        $_carb_ph_upper   = $carb_ph_upper;
-        $_carb_ph_lower   = $carb_ph_lower;
-        $_bicarb_ph_upper = $bicarb_ph_upper;
-        $_bicarb_ph_lower = $bicarb_ph_lower;
+        $ctx->{carb_ph_upper}   = $carb_ph_upper;
+        $ctx->{carb_ph_lower}   = $carb_ph_lower;
+        $ctx->{bicarb_ph_upper} = $bicarb_ph_upper;
+        $ctx->{bicarb_ph_lower} = $bicarb_ph_lower;
     }
 
     # =========================================================================
     # MÉTODO 4 — CTC sobre endpoint de carbonato (Powell)
     # =========================================================================
     my ($alk4, $Ct4, $carb_endpt4_vol, $carb_endpt4, $Method4_success) = (0, 0, 0, undef, 0);
+    my (%vol4, %calc_slope4);   # se conservan para construir la gráfica CTC-1
 
     if ($do_ctc) {
         my $n = scalar grep { $_ <= $carb_ph_upper && $_ >= $carb_ph_lower } keys %data;
@@ -446,14 +460,14 @@ sub calcular ($self) {
                 $Ct4 = $bicarb1_mg / BICARB_MEQ + $carb1_mg / CARB_MEQ;
             }
 
-            $_do_carb   = 1;
-            $_do_bicarb = 0;
-            eval { ($alk4, $Ct4) = _powell($alk4, $Ct4, 0.00001); };
+            $ctx->{do_carb}   = 1;
+            $ctx->{do_bicarb} = 0;
+            $ctx->{deadline}  = time() + POWELL_DEADLINE_S;
+            eval { ($alk4, $Ct4) = _powell($ctx, $alk4, $Ct4, 0.00001); };
             ($alk4, $Ct4) = (0, 0) if $@;
 
             if ($alk4 > 0 && $Ct4 > 0) {
                 $Method4_success = 1;
-                my (%vol4, %calc_slope4);
                 my ($lv, $lp);
                 my $ph = $carb_ph_upper;
                 while ($ph >= $carb_ph_lower) {
@@ -481,6 +495,7 @@ sub calcular ($self) {
     # MÉTODO 3 — CTC sobre endpoint de bicarbonato (Powell)
     # =========================================================================
     my ($alk3, $Ct3, $bicarb_endpt3_vol, $bicarb_endpt3, $Method3_success) = (0, 0, 0, undef, 0);
+    my (%vol3, %calc_slope3);   # se conservan para construir la gráfica CTC-1
     my $resultado_ctc1 = undef;
 
     if ($do_ctc) {
@@ -495,14 +510,14 @@ sub calcular ($self) {
                 $Ct3 = $bicarb1_mg / BICARB_MEQ + $carb1_mg / CARB_MEQ;
             }
 
-            $_do_carb   = 0;
-            $_do_bicarb = 1;
-            eval { ($alk3, $Ct3) = _powell($alk3, $Ct3, 0.00001); };
+            $ctx->{do_carb}   = 0;
+            $ctx->{do_bicarb} = 1;
+            $ctx->{deadline}  = time() + POWELL_DEADLINE_S;
+            eval { ($alk3, $Ct3) = _powell($ctx, $alk3, $Ct3, 0.00001); };
             ($alk3, $Ct3) = (0, 0) if $@;
 
             if ($alk3 > 0 && $Ct3 > 0) {
                 $Method3_success = 1;
-                my (%vol3, %calc_slope3);
                 my ($lv, $lp);
                 my $ph = $bicarb_ph_upper;
                 while ($ph >= $bicarb_ph_lower) {
@@ -552,6 +567,8 @@ sub calcular ($self) {
     # MÉTODO 5 — CTC sobre toda la curva (Powell)
     # =========================================================================
     my $resultado_ctc2 = undef;
+    my (%vol5, %calc_slope5);   # se conservan para construir la gráfica CTC-2
+    my ($alk5_final, $Ct5_final) = (0, 0);
 
     if ($do_ctc) {
         my $n = scalar keys %data;
@@ -565,13 +582,14 @@ sub calcular ($self) {
                 $Ct5 = $bicarb1_mg / BICARB_MEQ + $carb1_mg / CARB_MEQ;
             }
 
-            $_do_carb   = 0;
-            $_do_bicarb = 0;
-            eval { ($alk5, $Ct5) = _powell($alk5, $Ct5, 0.00001); };
+            $ctx->{do_carb}   = 0;
+            $ctx->{do_bicarb} = 0;
+            $ctx->{deadline}  = time() + POWELL_DEADLINE_S;
+            eval { ($alk5, $Ct5) = _powell($ctx, $alk5, $Ct5, 0.00001); };
             ($alk5, $Ct5) = (0, 0) if $@;
 
             if ($alk5 > 0 && $Ct5 > 0) {
-                my (%vol5, %calc_slope5);
+                ($alk5_final, $Ct5_final) = ($alk5, $Ct5);
                 my ($lv, $lp);
                 my $start_ph = $highest_ph > $carb_ph_upper ? $highest_ph : $carb_ph_upper;
                 my $ph = $start_ph;
@@ -646,23 +664,28 @@ sub calcular ($self) {
     # =========================================================================
     my $resultado_gran = undef;
 
+    # Estos valores se elevan al scope de calcular() porque la sección de
+    # gráficas (más abajo) necesita las pendientes y los datos crudos de las
+    # regresiones para reproducir EXACTAMENTE el plot del original (cada Fi
+    # se normaliza dividiendo entre |slope(Fi)|, no entre max|y|).
+    my ($GranF1_success, $GranF2_success, $GranF3_success) = (0, 0, 0);
+    my ($GranF4_success, $GranF5_success, $GranF6_success) = (0, 0, 0);
+    my ($GranF1_n, $GranF1_slope, $GranF1_int) = (0, 0, 0);
+    my ($GranF2_n, $GranF2_slope, $GranF2_int) = (0, 0, 0);
+    my ($GranF3_n, $GranF3_slope, $GranF3_int) = (0, 0, 0);
+    my ($GranF4_n, $GranF4_slope, $GranF4_int) = (0, 0, 0);
+    my ($GranF5_n, $GranF5_slope, $GranF5_int) = (0, 0, 0);
+    my ($GranF6_n, $GranF6_slope, $GranF6_int) = (0, 0, 0);
+    my (%GranF1, %GranF2, %GranF3, %GranF4, %GranF5, %GranF6);
+    my ($bicarb_endpt6_vol, $bicarb_endpt6b_vol) = (0, 0);
+    my ($carb_endpt6_vol, $carb_endpt6b_vol) = (0, 0);
+    my ($oh_endpt6_vol, $oh_endpt6b_vol) = (0, 0);
+    my ($alk6, $alk6b) = (0, 0);
+    my ($bicarb6_mg, $carb6_mg, $oh6_mg) = (0, 0, 0);
+    my ($bicarb6b_mg, $carb6b_mg) = (0, 0);
+    my ($check6, $check6b);
+
     if ($do_gran) {
-        my ($GranF1_success, $GranF2_success, $GranF3_success) = (0, 0, 0);
-        my ($GranF4_success, $GranF5_success, $GranF6_success) = (0, 0, 0);
-        my ($GranF1_n, $GranF1_slope, $GranF1_int) = (0, 0, 0);
-        my ($GranF2_n, $GranF2_slope, $GranF2_int) = (0, 0, 0);
-        my ($GranF3_n, $GranF3_slope, $GranF3_int) = (0, 0, 0);
-        my ($GranF4_n, $GranF4_slope, $GranF4_int) = (0, 0, 0);
-        my ($GranF5_n, $GranF5_slope, $GranF5_int) = (0, 0, 0);
-        my ($GranF6_n, $GranF6_slope, $GranF6_int) = (0, 0, 0);
-        my (%GranF1, %GranF2, %GranF3, %GranF4, %GranF5, %GranF6);
-        my ($bicarb_endpt6_vol, $bicarb_endpt6b_vol) = (0, 0);
-        my ($carb_endpt6_vol, $carb_endpt6b_vol) = (0, 0);
-        my ($oh_endpt6_vol, $oh_endpt6b_vol) = (0, 0);
-        my ($alk6, $alk6b) = (0, 0);
-        my ($bicarb6_mg, $carb6_mg, $oh6_mg) = (0, 0, 0);
-        my ($bicarb6b_mg, $carb6b_mg) = (0, 0);
-        my ($check6, $check6b);
 
         # =====================================================================
         # F1 — bicarbonato (pendiente positiva)
@@ -1056,6 +1079,11 @@ sub calcular ($self) {
 
     # =========================================================================
     # DATOS PARA GRÁFICAS
+    #
+    # OBJETIVO: replicar fielmente las 4 gráficas del original (ac_calcs.pl).
+    # Para eso, las curvas best-fit se construyen a partir de los puntos
+    # %vol3 / %vol4 / %vol5 que ya generó el optimizador Powell — en vez de
+    # reconstruir alk/Ct desde un endpoint (que introduce error).
     # =========================================================================
 
     # --- Gráfica 1: Curva de titulación medida + pendiente ---
@@ -1074,98 +1102,122 @@ sub calcular ($self) {
         }
     }
 
-    # --- Gráfica 2: Curva teórica CTC-1 ---
-    my (@g_ctc1_curva, @g_ctc1_pendiente);
-    if ($do_ctc && $resultado_ctc1 && !exists $resultado_ctc1->{error}
-        && defined $resultado_ctc1->{endpoint_bicarbonato_vol_ml}) {
-        my $ep_vol = $resultado_ctc1->{endpoint_bicarbonato_vol_ml};
-        my $alk3_r = $ep_vol * $F3_ml / $volume;
-        my $H0     = 10.0 ** (-$highest_ph);
-        my $Ct3_r  = ($alk3_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
-                     * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
-        my ($lv2, $lp2);
-        my $_phi_hi3 = $bicarb_ph_upper < $highest_ph ? $bicarb_ph_upper : $highest_ph;
-        my $_phi_lo3 = $bicarb_ph_lower > $lowest_ph  ? $bicarb_ph_lower : $lowest_ph;
-        my $ph = $_phi_hi3;
-        while ($ph >= $_phi_lo3 - 0.001) {
-            my $H   = 10.0 ** (-$ph);
-            my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
-            if ($den) {
-                my $v = $volume / $den
-                        * ($alk3_r / ALK_MEQ
-                           - $Ct3_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
-                           - $Kw/$H + $H/$gamma_H);
-                push @g_ctc1_curva, { x => _r2($v), ph => _r2($ph) };
-                if (defined $lv2 && abs($v - $lv2) > 1e-10) {
-                    push @g_ctc1_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2(($lp2 - $ph) / ($v - $lv2)) };
-                }
-                $lv2 = $v; $lp2 = $ph;
-            }
-            $ph -= 0.01;
+    # Helper: serializar un hash %vol{ph}=vol → array de puntos {x, ph} y
+    # un array de pendientes {x, pendiente}, recortado a [lowest_ph, highest_ph].
+    # Replica la lógica de @xyfit3 / @slopefit3 / @xyfit4 / @slopefit4 / @xyfit5.
+    my $serialize_curve = sub {
+        my ($vol_ref, $slope_ref) = @_;
+        my (@curva, @pend);
+        foreach my $ph (reverse sort { $a <=> $b } keys %$vol_ref) {
+            next if ($ph > $highest_ph);
+            last if ($ph < $lowest_ph);
+            push @curva, { x => _r2($vol_ref->{$ph}), ph => $ph + 0 };
         }
+        foreach my $ph (reverse sort { $a <=> $b } keys %$slope_ref) {
+            next if ($ph > $highest_ph);
+            last if ($ph < $lowest_ph);
+            push @pend, {
+                x         => _r2($vol_ref->{$ph}),
+                pendiente => $slope_ref->{$ph} + 0,
+            };
+        }
+        return (\@curva, \@pend);
+    };
+
+    # --- Gráfica 2: CTC-1 — fits independientes de bicarbonato y carbonato ---
+    # En el original son DOS curvas distintas:
+    #  • Method 3 (bicarb fit) → @xyfit3 / @slopefit3 desde %vol3
+    #  • Method 4 (carb  fit) → @xyfit4 / @slopefit4 desde %vol4
+    my (@g_ctc1_b_curva, @g_ctc1_b_pend, @g_ctc1_c_curva, @g_ctc1_c_pend);
+    if ($Method3_success && %vol3) {
+        my ($cv, $sp) = $serialize_curve->(\%vol3, \%calc_slope3);
+        @g_ctc1_b_curva = @$cv;
+        @g_ctc1_b_pend  = @$sp;
+    }
+    if ($Method4_success && %vol4) {
+        my ($cv, $sp) = $serialize_curve->(\%vol4, \%calc_slope4);
+        @g_ctc1_c_curva = @$cv;
+        @g_ctc1_c_pend  = @$sp;
     }
 
-    # --- Gráfica 3: Curva teórica CTC-2 ---
-    my (@g_ctc2_curva, @g_ctc2_pendiente);
-    if ($do_ctc && $resultado_ctc2 && !exists $resultado_ctc2->{error}) {
-        if (defined $resultado_ctc2->{endpoint_bicarbonato_vol_ml}) {
-            my $ep_vol = $resultado_ctc2->{endpoint_bicarbonato_vol_ml};
-            my $alk5_r = $ep_vol * $F3_ml / $volume;
-            my $H0     = 10.0 ** (-$highest_ph);
-            my $Ct5_r  = ($alk5_r / ALK_MEQ - $Kw/$H0 + $H0/$gamma_H)
-                         * ($H0*$H0 + $K1*$H0 + $K1*$K2) / ($K1*$H0 + 2.0*$K1*$K2);
-            my ($lv2, $lp2);
-            my $ph_start = $highest_ph > $carb_ph_upper ? $highest_ph : $carb_ph_upper;
-            my $ph = $ph_start;
-            while ($ph >= $lowest_ph - 0.001) {
-                my $H   = 10.0 ** (-$ph);
-                my $den = $acid_conc * $cor_factor + $Kw/$H - $H/$gamma_H;
-                if ($den) {
-                    my $v = $volume / $den
-                            * ($alk5_r / ALK_MEQ
-                               - $Ct5_r * ($K1*$H + 2.0*$K1*$K2) / ($H*$H + $K1*$H + $K1*$K2)
-                               - $Kw/$H + $H/$gamma_H);
-                    push @g_ctc2_curva, { x => _r2($v), ph => _r2($ph) };
-                    if (defined $lv2) {
-                        my $s = abs($v - $lv2) > 1e-10 ? ($lp2 - $ph) / ($v - $lv2) : 0;
-                        push @g_ctc2_pendiente, { x => _r2(($v + $lv2) / 2.0), pendiente => _r2($s) };
-                    }
-                    $lv2 = $v; $lp2 = $ph;
-                }
-                $ph -= 0.01;
-            }
-        }
+    # --- Gráfica 3: CTC-2 — fit sobre toda la curva (Method 5) ---
+    my (@g_ctc2_curva, @g_ctc2_pend);
+    if ($alk5_final > 0 && %vol5) {
+        my ($cv, $sp) = $serialize_curve->(\%vol5, \%calc_slope5);
+        @g_ctc2_curva = @$cv;
+        @g_ctc2_pend  = @$sp;
     }
 
-    # --- Gráfica 4: Funciones Gran ---
-    my (@g_F1, @g_F2, @g_F3, @g_F4, @g_F5, @g_F6);
-    if ($do_gran && $resultado_gran) {
-        my $bicarb_ep = $resultado_gran->{F1}{endpoint_bicarbonato_vol_ml} // 0;
-        my $carb_ep   = $resultado_gran->{F2}{endpoint_carbonato_vol_ml}  // 0;
-        my $bicarb_ep_counts = $bicarb_ep * $cpm;
-        my $carb_ep_counts   = $carb_ep   * $cpm;
+    # --- Gráfica 4: Funciones Gran F1..F6 ---
+    # IMPORTANTE: el original normaliza cada Fi por |slope(Fi)| (no por max|y|).
+    # De ese modo los puntos crudos caen sobre una línea con pendiente ±1 y la
+    # línea de fit se traza con esa misma pendiente partiendo desde el endpoint.
+    # Aquí exponemos slope (calculado por _regression sobre los datos de fit),
+    # endpoint y todos los puntos crudos {x: counts, y: raw_value}. El frontend
+    # divide y entre |slope| y dibuja la línea con pendiente slope_signo (±1).
+    my $gran_grafica = undef;
+    if ($do_gran) {
+        # Helper: serializa un %GranFi (hash {x_counts => y_raw}) a array
+        # ordenado por x. Mantiene los valores SIN normalizar.
+        my $points = sub {
+            my $href = shift;
+            return [
+                map { { x => $_ + 0, y => $href->{$_} + 0 } }
+                sort { $a <=> $b } keys %$href
+            ];
+        };
 
-        foreach my $ph (reverse sort { $a <=> $b } keys %data) {
-            my $H = 10.0 ** (-$ph);
-            if ($ph <= $ph_split) {
-                my $gf1 = ($volume + $data{$ph} / $cpm) * $H / $gamma_H;
-                push @g_F1, { x => $data{$ph} + 0, y => $gf1 + 0 };
-            }
-            if ($bicarb_ep > 0) {
-                my $gf2 = ($bicarb_ep_counts - $data{$ph}) / $cpm * $H;
-                push @g_F2, { x => $data{$ph} + 0, y => $gf2 + 0 };
-            }
-            if ($carb_ep >= 0) {
-                my $gf3 = ($data{$ph} / $cpm - $carb_ep) * (10.0 ** $ph);
-                push @g_F3, { x => $data{$ph} + 0, y => $gf3 + 0 };
-            }
-        }
+        # Endpoints en counts (los originales del optimizador Gran están en
+        # counts dentro de las variables $bicarb_endpt6_vol, etc.).
+        $gran_grafica = {
+            F1 => {
+                puntos       => $points->(\%GranF1),
+                slope        => $GranF1_slope + 0,
+                endpoint_vol => $GranF1_success ? _r2($bicarb_endpt6_vol)   : undef,
+                slope_signo  => 1,
+                exito        => $GranF1_success ? \1 : \0,
+            },
+            F2 => {
+                puntos       => $points->(\%GranF2),
+                slope        => $GranF2_slope + 0,
+                endpoint_vol => $GranF2_success ? _r2($carb_endpt6_vol)     : undef,
+                slope_signo  => 1,
+                exito        => $GranF2_success ? \1 : \0,
+            },
+            F3 => {
+                puntos       => $points->(\%GranF3),
+                slope        => $GranF3_slope + 0,
+                endpoint_vol => $GranF3_success ? _r2($bicarb_endpt6b_vol)  : undef,
+                slope_signo  => -1,
+                exito        => $GranF3_success ? \1 : \0,
+            },
+            F4 => {
+                puntos       => $points->(\%GranF4),
+                slope        => $GranF4_slope + 0,
+                endpoint_vol => $GranF4_success ? _r2($carb_endpt6b_vol)    : undef,
+                slope_signo  => -1,
+                exito        => $GranF4_success ? \1 : \0,
+            },
+            F5 => {
+                puntos       => $points->(\%GranF5),
+                slope        => $GranF5_slope + 0,
+                endpoint_vol => $GranF5_success ? _r2($oh_endpt6_vol)       : undef,
+                slope_signo  => 1,
+                exito        => $GranF5_success ? \1 : \0,
+            },
+            F6 => {
+                puntos       => $points->(\%GranF6),
+                slope        => $GranF6_slope + 0,
+                endpoint_vol => $GranF6_success ? _r2($oh_endpt6b_vol)      : undef,
+                slope_signo  => -1,
+                exito        => $GranF6_success ? \1 : \0,
+            },
+        };
     }
 
     # =========================================================================
     # Respuesta final
     # =========================================================================
-    alarm(0);
     return $self->render(json => {
         constantes => {
             log10_Kw      => _r2($log10Kw),
@@ -1192,19 +1244,18 @@ sub calcular ($self) {
         graficas     => {
             titulacion => \@g_titulacion,
             pendiente  => \@g_pendiente,
+            # CTC-1: separado en bicarbonato (Method 3) y carbonato (Method 4)
             ctc_1      => {
-                curva     => \@g_ctc1_curva,
-                pendiente => \@g_ctc1_pendiente,
+                bicarb => { curva => \@g_ctc1_b_curva, pendiente => \@g_ctc1_b_pend },
+                carb   => { curva => \@g_ctc1_c_curva, pendiente => \@g_ctc1_c_pend },
             },
+            # CTC-2: una sola curva (Method 5) sobre el rango completo
             ctc_2      => {
                 curva     => \@g_ctc2_curva,
-                pendiente => \@g_ctc2_pendiente,
+                pendiente => \@g_ctc2_pend,
             },
-            gran       => {
-                F1 => \@g_F1,
-                F2 => \@g_F2,
-                F3 => \@g_F3,
-            },
+            # Gran: 6 funciones, cada una con sus puntos crudos, slope y endpoint
+            gran => $gran_grafica,
         },
     });
 }
@@ -1306,8 +1357,11 @@ sub _get_criteria {
 }
 
 # --- Powell (powell) ---------------------------------------------------------
+# Refactor: el contexto (datos, constantes, regiones de pH, do_carb/do_bicarb,
+# deadline) se pasa como hashref $ctx en vez de variables a nivel de paquete.
+# Esto elimina cualquier estado compartido entre cálculos concurrentes.
 sub _powell {
-    my ($alk, $Ct, $ftol) = @_;
+    my ($ctx, $alk, $Ct, $ftol) = @_;
     my $itmax = 75;
     my $n     = 1;
     my (@p, @pt, @xi, @xit, @ptt, @pass);
@@ -1316,11 +1370,16 @@ sub _powell {
     $p[1] = ($Ct  > 0) ? log($Ct)  : -6;
     @xi   = ([1, 0], [0, 1]);
 
-    my $fret = _get_func(@p);
+    my $fret = _get_func($ctx, @p);
     @pt = @p;
 
     my $iter = 0;
     while ($iter++ <= $itmax) {
+        # Deadline cooperativo: salimos si excedemos el presupuesto temporal.
+        # Esto reemplaza el alarm() / SIGALRM antiguo, que era inseguro a nivel
+        # de proceso y podía interrumpir requests vecinos.
+        die "powell-deadline\n" if defined $ctx->{deadline} && time() > $ctx->{deadline};
+
         my $fp   = $fret;
         my $ibig = 0;
         my $del  = 0.0;
@@ -1328,7 +1387,7 @@ sub _powell {
         for my $i (0..$n) {
             my @xit_l = map { $xi[$_][$i] } 0..$n;
             my $fptt  = $fret;
-            @pass = _linmin(@p, @xit_l, $n);
+            @pass = _linmin($ctx, @p, @xit_l, $n);
             $fret = pop @pass;
             @p    = splice(@pass, 0, $n+1);
             @xit_l = @pass;
@@ -1349,13 +1408,13 @@ sub _powell {
             $xit[$j] = $p[$j] - $pt[$j];
             $pt[$j]  = $p[$j];
         }
-        my $fptt = _get_func(@ptt);
+        my $fptt = _get_func($ctx, @ptt);
         next if $fptt >= $fp;
         my $t = 2.0 * ($fp - 2.0*$fret + $fptt) * ($fp - $fret - $del)**2
                 - $del * ($fp - $fptt)**2;
         next if $t >= 0.0;
 
-        @pass = _linmin(@p, @xit, $n);
+        @pass = _linmin($ctx, @p, @xit, $n);
         $fret = pop @pass;
         @p    = splice(@pass, 0, $n+1);
         @xit  = @pass;
@@ -1366,16 +1425,17 @@ sub _powell {
 
 # --- Linmin ------------------------------------------------------------------
 sub _linmin {
-    my $n  = pop @_;
-    my @p  = splice(@_, 0, $n+1);
-    my @xi = @_;
+    my $ctx = shift;
+    my $n   = pop @_;
+    my @p   = splice(@_, 0, $n+1);
+    my @xi  = @_;
 
     for my $j (0..$n) {
-        $_pcom[$j]  = $p[$j];
-        $_xicom[$j] = $xi[$j];
+        $ctx->{pcom}[$j]  = $p[$j];
+        $ctx->{xicom}[$j] = $xi[$j];
     }
-    my ($ax, $xx, $bx) = _mnbrak(0.0, 1.0);
-    my ($xmin, $fret)  = _brent($ax, $xx, $bx, 0.0001);
+    my ($ax, $xx, $bx) = _mnbrak($ctx, 0.0, 1.0);
+    my ($xmin, $fret)  = _brent($ctx, $ax, $xx, $bx, 0.0001);
 
     for my $j (0..$n) {
         $xi[$j]  = $xmin * $xi[$j];
@@ -1386,13 +1446,13 @@ sub _linmin {
 
 # --- Mnbrak ------------------------------------------------------------------
 sub _mnbrak {
-    my ($ax, $bx) = @_;
+    my ($ctx, $ax, $bx) = @_;
     my ($gold, $glimit, $tiny) = (1.618034, 100.0, 1e-20);
-    my ($fa, $fb) = (_onedim($ax), _onedim($bx));
+    my ($fa, $fb) = (_onedim($ctx, $ax), _onedim($ctx, $bx));
 
     if ($fb > $fa) { ($ax,$bx) = ($bx,$ax); ($fa,$fb) = ($fb,$fa); }
     my $cx = $bx + $gold * ($bx - $ax);
-    my $fc = _onedim($cx);
+    my $fc = _onedim($ctx, $cx);
 
     my $_mnbrak_iter = 0;
     while ($fb >= $fc && $_mnbrak_iter++ < 200) {
@@ -1403,18 +1463,18 @@ sub _mnbrak {
         my $fu;
 
         if (($bx-$u)*($u-$cx) > 0.0) {
-            $fu = _onedim($u);
+            $fu = _onedim($ctx, $u);
             return ($bx, $u, $cx) if $fu < $fc;
             return ($ax, $bx, $u) if $fu > $fb;
             $u = $cx + $gold * ($cx - $bx);
-            $fu = _onedim($u);
+            $fu = _onedim($ctx, $u);
         } elsif (($cx-$u)*($u-$ulim) > 0.0) {
-            $fu = _onedim($u);
-            if ($fu < $fc) { $bx=$cx; $cx=$u; $u=$cx+$gold*($cx-$bx); $fb=$fc; $fc=$fu; $fu=_onedim($u); }
+            $fu = _onedim($ctx, $u);
+            if ($fu < $fc) { $bx=$cx; $cx=$u; $u=$cx+$gold*($cx-$bx); $fb=$fc; $fc=$fu; $fu=_onedim($ctx, $u); }
         } elsif (($u-$ulim)*($ulim-$cx) >= 0.0) {
-            $u = $ulim; $fu = _onedim($u);
+            $u = $ulim; $fu = _onedim($ctx, $u);
         } else {
-            $u = $cx + $gold * ($cx - $bx); $fu = _onedim($u);
+            $u = $cx + $gold * ($cx - $bx); $fu = _onedim($ctx, $u);
         }
         ($ax,$bx,$cx) = ($bx,$cx,$u);
         ($fa,$fb,$fc) = ($fb,$fc,$fu);
@@ -1424,11 +1484,11 @@ sub _mnbrak {
 
 # --- Brent -------------------------------------------------------------------
 sub _brent {
-    my ($ax, $bx, $cx, $tol) = @_;
+    my ($ctx, $ax, $bx, $cx, $tol) = @_;
     my ($itmax, $cgold, $zeps) = (100, 0.3819660, 1e-10);
     my ($a, $b) = sort { $a <=> $b } ($ax, $cx);
     my ($v, $w, $x, $e, $d) = ($bx, $bx, $bx, 0.0, 0.0);
-    my ($fv, $fw, $fx) = (_onedim($x), _onedim($x), _onedim($x));
+    my ($fv, $fw, $fx) = (_onedim($ctx, $x), _onedim($ctx, $x), _onedim($ctx, $x));
 
     for my $iter (1..$itmax) {
         my $xm   = 0.5 * ($a + $b);
@@ -1459,7 +1519,7 @@ sub _brent {
             $d = $cgold * $e;
         }
         $u = abs($d) >= $tol1 ? $x+$d : $x + _sign($tol1, $d);
-        my $fu = _onedim($u);
+        my $fu = _onedim($ctx, $u);
 
         if ($fu <= $fx) {
             $u >= $x ? ($a=$x) : ($b=$x);
@@ -1475,30 +1535,36 @@ sub _brent {
 
 # --- Onedim ------------------------------------------------------------------
 sub _onedim {
-    my ($x) = @_;
-    my @xt = ($x * $_xicom[0] + $_pcom[0], $x * $_xicom[1] + $_pcom[1]);
-    return _get_func(@xt);
+    my ($ctx, $x) = @_;
+    my @xt = (
+        $x * $ctx->{xicom}[0] + $ctx->{pcom}[0],
+        $x * $ctx->{xicom}[1] + $ctx->{pcom}[1],
+    );
+    return _get_func($ctx, @xt);
 }
 
 # --- Get_func ----------------------------------------------------------------
 sub _get_func {
-    my ($alk, $Ct) = @_;
+    my ($ctx, $alk, $Ct) = @_;
     $alk = exp($alk); $Ct = exp($Ct);
-    my $sum = 0.0;
+    my $sum  = 0.0;
+    my $data = $ctx->{data};
 
-    foreach my $ph (reverse sort { $a <=> $b } keys %_data) {
-        next if ($_do_bicarb && $ph > $_bicarb_ph_upper);
-        last if ($_do_bicarb && $ph < $_bicarb_ph_lower);
-        next if ($_do_carb   && $ph > $_carb_ph_upper);
-        last if ($_do_carb   && $ph < $_carb_ph_lower);
+    foreach my $ph (reverse sort { $a <=> $b } keys %$data) {
+        next if ($ctx->{do_bicarb} && $ph > $ctx->{bicarb_ph_upper});
+        last if ($ctx->{do_bicarb} && $ph < $ctx->{bicarb_ph_lower});
+        next if ($ctx->{do_carb}   && $ph > $ctx->{carb_ph_upper});
+        last if ($ctx->{do_carb}   && $ph < $ctx->{carb_ph_lower});
         my $H = 10.0 ** (-$ph);
         next if $H == 0.0;
-        my $denom = $_acid_conc * $_cor_factor + $_Kw/$H - $H/$_gamma_H;
+        my $denom = $ctx->{acid_conc} * $ctx->{cor_factor} + $ctx->{Kw}/$H - $H/$ctx->{gamma_H};
         next unless $denom;
-        my $vol = $_cpm * $_volume / $denom
-                  * ($alk - $Ct*($_K1*$H + 2.0*$_K1*$_K2)/($H*$H + $_K1*$H + $_K1*$_K2)
-                     - $_Kw/$H + $H/$_gamma_H);
-        $sum += ($vol - $_data{$ph}) ** 2;
+        my $vol = $ctx->{cpm} * $ctx->{volume} / $denom
+                  * ($alk
+                     - $Ct * ($ctx->{K1}*$H + 2.0*$ctx->{K1}*$ctx->{K2})
+                            / ($H*$H + $ctx->{K1}*$H + $ctx->{K1}*$ctx->{K2})
+                     - $ctx->{Kw}/$H + $H/$ctx->{gamma_H});
+        $sum += ($vol - $data->{$ph}) ** 2;
     }
     return $sum;
 }

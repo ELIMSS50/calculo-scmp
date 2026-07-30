@@ -36,6 +36,13 @@ use Mojo::Base 'Mojolicious::Controller', -signatures;
 
 use POSIX qw();
 use Time::HiRes qw(time);
+use Scalar::Util qw(looks_like_number);
+
+# Tope de puntos de titulación por petición. Una titulación real tiene
+# decenas de puntos; la regresión ponderada de Gran es O(n³), así que un
+# payload enorme podría trabar un worker por minutos. 500 mantiene el peor
+# caso en fracciones de segundo.
+use constant MAX_PUNTOS => 500;
 
 # Pesos moleculares ×1000 — mismos valores que ac_calcs.pl
 use constant CARB_MEQ   => 60009.2;
@@ -69,6 +76,15 @@ sub calcular ($self) {
     for my $campo (qw(volumen concentracion_acido titulacion)) {
         unless (defined $p->{$campo}) {
             return $self->render(json => { error => "El campo '$campo' es requerido" }, status => 400);
+        }
+    }
+
+    # --- Campos numéricos: rechazar strings no numéricos en vez de tratarlos como 0 ---
+    for my $campo (qw(volumen concentracion_acido temperatura conductancia
+                      factor_correccion endpoint_carbonato endpoint_bicarbonato
+                      counts_por_ml)) {
+        if (defined $p->{$campo} && !looks_like_number($p->{$campo})) {
+            return $self->render(json => { error => "El campo '$campo' debe ser numérico" }, status => 400);
         }
     }
 
@@ -115,12 +131,18 @@ sub calcular ($self) {
     unless (ref $tit_raw eq 'ARRAY' && scalar @$tit_raw >= 2) {
         return $self->render(json => { error => 'La titulacion debe ser un array con al menos 2 puntos' }, status => 400);
     }
+    if (scalar @$tit_raw > MAX_PUNTOS) {
+        return $self->render(json => { error => 'La titulacion admite como máximo ' . MAX_PUNTOS . ' puntos' }, status => 400);
+    }
 
     # Construir %data = ph => volumen_acido (igual que en ac_calcs.pl)
     my %data;
     for my $punto (@$tit_raw) {
-        unless (defined $punto->{ph} && defined $punto->{volumen_acido}) {
+        unless (ref $punto eq 'HASH' && defined $punto->{ph} && defined $punto->{volumen_acido}) {
             return $self->render(json => { error => 'Cada punto de titulación requiere "ph" y "volumen_acido"' }, status => 400);
+        }
+        unless (looks_like_number($punto->{ph}) && looks_like_number($punto->{volumen_acido})) {
+            return $self->render(json => { error => 'Cada "ph" y "volumen_acido" debe ser numérico' }, status => 400);
         }
         my $ph  = sprintf("%.2f", $punto->{ph} + 0);
         $data{$ph} = $punto->{volumen_acido} + 0;
@@ -153,15 +175,23 @@ sub calcular ($self) {
         return $self->render(json => { error => 'La tabla de titulación no tiene suficientes puntos válidos' }, status => 400);
     }
 
+    # Chequeo de rango de pH del original: valores absurdos (typos) generan
+    # exponentes 10**ph enormes y resultados sin sentido físico.
+    if ($highest_ph > 15 || $lowest_ph < -1) {
+        return $self->render(json => { error => 'El rango de pH excede lo esperado (se aceptan valores entre -1 y 15)' }, status => 400);
+    }
+
     if ($data{$highest_ph} != 0.0) {
         return $self->render(json => { error => 'El primer punto de la titulación debe tener volumen_acido = 0 (pH inicial de la muestra)' }, status => 400);
     }
 
     # --- Constantes de equilibrio ---
     my ($Kw, $K1, $K2, $gamma_H, $I) = _get_constants($temp, $spcond);
-    my $log10Kw = log($Kw) / log(10.0);
-    my $log10K1 = log($K1) / log(10.0);
-    my $log10K2 = log($K2) / log(10.0);
+    # Igual que el original (ac_calcs.pl): los log10 se redondean a 2 decimales
+    # ANTES de usarse en ph_split, las regiones de pH y los límites Gran.
+    my $log10Kw = sprintf("%.2f", log($Kw) / log(10.0));
+    my $log10K1 = sprintf("%.2f", log($K1) / log(10.0));
+    my $log10K2 = sprintf("%.2f", log($K2) / log(10.0));
     my $ph_split = -1.0 * $log10K1;
 
     # Factores F en unidades del titulador (counts):
@@ -531,7 +561,6 @@ sub calcular ($self) {
                 }
                 my $max_s = 0;
                 foreach my $ph (reverse sort { $a <=> $b } keys %calc_slope3) {
-                    next if $ph > $highest_ph;
                     if ($calc_slope3{$ph} > $max_s) {
                         $max_s = $calc_slope3{$ph};
                         $bicarb_endpt3 = $ph;
@@ -736,7 +765,7 @@ sub calcular ($self) {
             @reg_arr  = ();
             foreach my $ph (sort { $a <=> $b } keys %data) {
                 last if ($ph > $GranF3_start);
-                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                my $GrF3 = ($data{$ph} - $carb_endpt6_vol) / $cpm * 10.0 ** $ph;
                 push @Gran_arr, $data{$ph}, $GrF3;
                 push @reg_arr,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
             }
@@ -851,7 +880,7 @@ sub calcular ($self) {
             @reg_arr  = ();
             foreach my $ph (sort { $a <=> $b } keys %data) {
                 last if ($ph > $GranF3_start);
-                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                my $GrF3 = ($data{$ph} - $carb_endpt6_vol) / $cpm * 10.0 ** $ph;
                 push @Gran_arr, $data{$ph}, $GrF3;
                 push @reg_arr,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
             }
@@ -887,7 +916,7 @@ sub calcular ($self) {
                             my (@new_Gran, @new_reg);
                             foreach my $ph (sort { $a <=> $b } keys %data) {
                                 last if ($ph > $GranF3_start);
-                                my $GrF3 = ($data{$ph} / $cpm - $carb_endpt6_vol) * 10.0 ** $ph;
+                                my $GrF3 = ($data{$ph} - $carb_endpt6_vol) / $cpm * 10.0 ** $ph;
                                 push @new_Gran, $data{$ph}, $GrF3;
                                 push @new_reg,  $data{$ph}, $GrF3 if ($ph >= $GranF3_end);
                             }
